@@ -3,14 +3,14 @@
 **Status:** Draft for implementation  
 **Audience:** Project owner and Codex  
 **Initial user:** One person (the project owner)  
-**Primary interface:** Telegram  
+**Primary interface:** Discord direct messages
 **Last updated:** September 6, 2026
 
 ## 1. Product summary
 
-Personal AI Inbox is a private Telegram-based inbox for capturing miscellaneous parts of everyday life without organizing them at the time of capture.
+Personal AI Inbox is a private Discord DM-based inbox for capturing miscellaneous parts of everyday life without organizing them at the time of capture.
 
-The user can send text, voice notes, URLs, YouTube links, GitHub repositories, images, and screenshots to a Telegram bot. The system safely stores the original submission, extracts useful information, creates a searchable semantic representation, and later retrieves relevant items through natural-language questions.
+The user can send text, voice notes, URLs, YouTube links, GitHub repositories, images, and screenshots to a Discord bot. The system safely stores the original submission, extracts useful information, creates a searchable semantic representation, and later retrieves relevant items through natural-language questions.
 
 The core principle is:
 
@@ -38,7 +38,7 @@ V1 is successful when the user begins to trust the inbox as the default place to
 
 V1 has one authorized user: the project owner.
 
-The system may assume a single-user environment, but access to the Telegram bot must still be restricted by an allowlisted Telegram user ID. Messages from other users must not be ingested.
+The system may assume a single-user environment, but access to the Discord bot must still be restricted by an allowlisted Discord user ID. V1 processes direct messages only; messages from other users or shared server channels must not be ingested.
 
 Multi-user accounts, teams, onboarding, subscriptions, and public availability are outside V1.
 
@@ -105,7 +105,7 @@ Each result should include enough context to recognize it:
 - Short summary or relevant excerpt
 - Date saved
 - Source type
-- Original URL or a way to reach the original Telegram content when applicable
+- Original URL or a way to reach the original Discord content when applicable
 
 The original item must remain accessible. The system must not rely exclusively on an AI-generated summary.
 
@@ -143,7 +143,7 @@ Corrections must not change or destroy the original captured content.
 
 ### Voice notes
 
-- Preserve Telegram file identifiers and relevant source metadata.
+- Preserve Discord attachment identifiers and relevant source metadata.
 - Download or durably store the audio according to the selected storage policy.
 - Transcribe the recording using an external speech-to-text provider.
 - Use the transcription as normalized searchable content.
@@ -170,7 +170,7 @@ Corrections must not change or destroy the original captured content.
 
 ### Images and screenshots
 
-- Preserve the Telegram file reference and relevant metadata.
+- Preserve the Discord attachment reference and relevant metadata.
 - Store the image durably according to the selected storage policy.
 - Use a vision-capable model to create a factual retrieval-oriented description.
 - Extract visible text when useful.
@@ -182,13 +182,15 @@ V1 should distinguish between an immutable capture and the searchable items deri
 
 ### Capture
 
-Represents the original Telegram submission.
+Represents the original Discord submission.
 
 Suggested fields:
 
 - `id`
-- `telegram_chat_id`
-- `telegram_message_id`
+- `platform`
+- `external_message_id`
+- `conversation_id`
+- `sender_id`
 - `source_type`
 - `raw_text`
 - `source_metadata`
@@ -238,7 +240,7 @@ Simple nearest-neighbour similarity is sufficient for V1. A graph database is no
 - Original input must be persisted before enrichment begins.
 - AI or third-party service failures must not lose captures.
 - Enrichment jobs must be retryable.
-- Repeated Telegram webhook deliveries must not create duplicate captures.
+- Repeated Discord message deliveries must not create duplicate captures.
 - Duplicate URLs should be detected and communicated without unexpectedly deleting either submission.
 - Processing status must be observable through logs or a simple diagnostic mechanism.
 
@@ -251,7 +253,7 @@ Simple nearest-neighbour similarity is sufficient for V1. A graph database is no
 
 ### Privacy and security
 
-- Only the allowlisted Telegram account can use the bot.
+- Only the allowlisted Discord account can use the bot.
 - Secrets must be provided through environment variables and never committed.
 - Logs must not unnecessarily expose private message bodies, tokens, or downloaded files.
 - The user must be able to delete saved items.
@@ -267,9 +269,9 @@ V1 does not need a universal plugin framework. Straightforward provider abstract
 ## 9. Proposed technical architecture
 
 ```text
-Telegram Bot
+Discord DM Bot (Gateway process)
     ↓
-FastAPI webhook/API
+Capture service / FastAPI API
     ↓
 Durable capture storage
     ↓
@@ -319,9 +321,9 @@ V1 is considered usable when all of the following are true:
 6. Retrieval handles both conceptual questions and exact identifying terms.
 7. The bot does not fabricate a saved item when no credible result exists.
 8. `/recent`, `/undo`, deletion, correction, and basic completion behavior work.
-9. Duplicate webhook deliveries do not produce duplicate records.
+9. Duplicate Discord message deliveries do not produce duplicate records.
 10. Processing failures can be retried without resending the original message.
-11. Access is restricted to the configured Telegram user.
+11. Access is restricted to the configured Discord user.
 12. Secrets are not committed, and setup is documented for a fresh environment.
 
 ## 12. Implementation milestones
@@ -329,12 +331,12 @@ V1 is considered usable when all of the following are true:
 ### Milestone 1 — Durable text capture
 
 - Project setup and local development instructions
-- Telegram webhook
+- Discord Gateway bot
 - Single-user allowlist
 - PostgreSQL schema and migrations
 - Text capture persisted before acknowledgement
 - `/recent`, `/undo`, and deletion
-- Tests for authorization, persistence, and webhook idempotency
+- Tests for authorization, persistence, and message idempotency
 
 ### Milestone 2 — Enrichment and search
 
@@ -408,6 +410,6 @@ These decisions should be made during the architecture and setup phase without c
 - Initial LLM, embedding, speech-to-text, and vision providers
 - URL extraction library or service
 - Exact thresholds for query routing and related-item notifications
-- Retention and backup policy for downloaded Telegram media
+- Retention and backup policy for downloaded Discord media
 
 Choices should optimize for ease of operation, privacy, recoverability, and low cost for one user.
