@@ -1,21 +1,29 @@
+import asyncio
 import logging
 import re
-from datetime import UTC, datetime
+import uuid
+from collections.abc import Callable
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import discord
 from sqlalchemy import or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.core.config import Settings
 from app.models.capture import Capture, MessageReceipt
+from app.providers.openai import EnrichmentProvider, OpenAIProvider
+from app.workers.enrichment import enrich_capture, pending_capture_ids
 
 logger = logging.getLogger(__name__)
 PLATFORM = "discord"
 DISCORD_MESSAGE_LIMIT = 2_000
 SEARCH_RESULT_LIMIT = 5
 TOKEN_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
+ISO_DATE_PATTERN = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
+SEMANTIC_MIN_SIMILARITY = 0.30
+EnrichmentScheduler = Callable[[uuid.UUID], None]
 
 
 def _parse_command(text: str) -> tuple[str, str] | None:
@@ -45,7 +53,7 @@ def _format_recent(captures: list[Capture]) -> str:
         text = " ".join(capture.raw_text.split())
         if len(text) > 280:
             text = f"{text[:277]}..."
-        lines.append(f"{index}. [{timestamp}] {text}")
+        lines.append(f"{index}. [{timestamp}] ({capture.processing_status}) {text}")
         if len("\n".join(lines)) > DISCORD_MESSAGE_LIMIT - 20:
             lines.append("...more captures available later")
             break
@@ -87,58 +95,175 @@ def _format_search_results(captures: list[Capture], query: str) -> str:
         if len(text) > 280:
             text = f"{text[:277]}..."
         lines.append(f"{index}. [{timestamp}] {text}")
+        if capture.summary:
+            lines.append(f"   Summary: {_truncate(capture.summary, 240)}")
         lines.append(f"   Source: {_capture_source(capture)}")
     return _truncate("\n".join(lines))
+
+
+def _date_bounds(
+    query: str,
+    now: datetime | None = None,
+) -> tuple[datetime | None, datetime | None]:
+    """Extract a small set of unambiguous UTC date filters from a query."""
+
+    current = now or datetime.now(UTC)
+    day_start = current.replace(hour=0, minute=0, second=0, microsecond=0)
+    folded = query.casefold()
+    if "yesterday" in folded:
+        return day_start - timedelta(days=1), day_start
+    if "today" in folded:
+        return day_start, day_start + timedelta(days=1)
+    if "last week" in folded:
+        this_monday = day_start - timedelta(days=day_start.weekday())
+        return this_monday - timedelta(days=7), this_monday
+    if "this week" in folded:
+        return day_start - timedelta(days=day_start.weekday()), day_start + timedelta(days=1)
+    if "last month" in folded:
+        first_this_month = day_start.replace(day=1)
+        previous_month_start = (first_this_month - timedelta(days=1)).replace(
+            day=1,
+            hour=0,
+            minute=0,
+            second=0,
+            microsecond=0,
+        )
+        return previous_month_start, first_this_month
+    if "this month" in folded:
+        return day_start.replace(day=1), day_start + timedelta(days=1)
+
+    match = ISO_DATE_PATTERN.search(query)
+    if match:
+        try:
+            target = datetime.strptime(match.group(1), "%Y-%m-%d").replace(tzinfo=UTC)
+        except ValueError:
+            return None, None
+        return target, target + timedelta(days=1)
+    return None, None
+
+
+def _cosine_similarity(left: list[float] | None, right: list[float] | None) -> float | None:
+    if not left or not right or len(left) != len(right):
+        return None
+    try:
+        dot = sum(float(a) * float(b) for a, b in zip(left, right, strict=True))
+        left_norm = sum(float(value) ** 2 for value in left) ** 0.5
+        right_norm = sum(float(value) ** 2 for value in right) ** 0.5
+    except (TypeError, ValueError):
+        return None
+    if left_norm == 0 or right_norm == 0:
+        return None
+    return dot / (left_norm * right_norm)
 
 
 def _search_captures(
     session: Session,
     conversation_id: int,
     query: str,
+    query_embedding: list[float] | None = None,
 ) -> list[Capture]:
-    """Find active captures with deterministic token-overlap ranking.
-
-    The database performs the case-insensitive lexical prefilter. Ranking is
-    then done in Python so the same behavior is covered by the SQLite test
-    fixture and PostgreSQL production database.
-    """
+    """Find active captures with hybrid lexical and semantic ranking."""
 
     tokens = _search_tokens(query)
-    if not tokens:
+    if not tokens and query_embedding is None:
         return []
 
-    candidates = list(
-        session.scalars(
-            select(Capture).where(
-                Capture.platform == PLATFORM,
-                Capture.conversation_id == conversation_id,
-                Capture.deleted_at.is_(None),
-                or_(*(Capture.raw_text.ilike(f"%{token}%") for token in tokens)),
+    start, end = _date_bounds(query)
+    base_conditions = [
+        Capture.platform == PLATFORM,
+        Capture.conversation_id == conversation_id,
+        Capture.deleted_at.is_(None),
+    ]
+    if start is not None:
+        base_conditions.append(Capture.created_at >= start)
+    if end is not None:
+        base_conditions.append(Capture.created_at < end)
+
+    lexical_condition = or_(
+        *(
+            expression
+            for token in tokens
+            for expression in (
+                Capture.raw_text.ilike(f"%{token}%"),
+                Capture.normalized_text.ilike(f"%{token}%"),
+                Capture.summary.ilike(f"%{token}%"),
             )
         )
-    )
+    ) if tokens else None
+
+    lexical_candidates: list[Capture] = []
+    if lexical_condition is not None:
+        lexical_candidates = list(
+            session.scalars(select(Capture).where(*base_conditions, lexical_condition))
+        )
+
+    candidates_by_id = {capture.id: capture for capture in lexical_candidates}
+    if query_embedding is not None:
+        semantic_statement = select(Capture).where(
+            *base_conditions,
+            Capture.embedding.is_not(None),
+        )
+        bind = session.get_bind()
+        if bind.dialect.name == "postgresql":
+            semantic_statement = semantic_statement.order_by(
+                Capture.embedding.cosine_distance(query_embedding)
+            ).limit(100)
+        try:
+            semantic_candidates = list(session.scalars(semantic_statement))
+        except SQLAlchemyError:
+            session.rollback()
+            logger.exception("Semantic database search failed; using lexical candidates")
+            semantic_candidates = []
+        candidates_by_id.update({capture.id: capture for capture in semantic_candidates})
+
+    candidates = list(candidates_by_id.values())
 
     query_text = " ".join(tokens)
-    ranked: list[tuple[int, Capture]] = []
+    ranked: list[tuple[float, float, Capture]] = []
     for capture in candidates:
-        capture_tokens = set(_search_tokens(capture.raw_text))
+        searchable_text = " ".join(
+            part
+            for part in (
+                capture.raw_text,
+                capture.normalized_text or "",
+                capture.summary or "",
+                " ".join(capture.topics or []),
+                " ".join(
+                    value
+                    for values in (capture.entities or {}).values()
+                    for value in values
+                    if isinstance(value, str)
+                ),
+            )
+            if part
+        )
+        capture_tokens = set(_search_tokens(searchable_text))
         matched_count = sum(token in capture_tokens for token in tokens)
-        if matched_count == 0:
+        semantic_score = _cosine_similarity(query_embedding, capture.embedding)
+        if query_embedding is None and matched_count == 0:
             continue
-        normalized_capture = " ".join(_search_tokens(capture.raw_text))
-        phrase_bonus = 100 if query_text in normalized_capture else 0
-        score = phrase_bonus + (matched_count * 10)
-        ranked.append((score, capture))
+        if query_embedding is not None and matched_count == 0:
+            if semantic_score is None or semantic_score < SEMANTIC_MIN_SIMILARITY:
+                continue
+        normalized_capture = " ".join(_search_tokens(searchable_text))
+        phrase_bonus = 100 if query_text and query_text in normalized_capture else 0
+        # A full phrase or exact term remains a strong signal, while semantic
+        # similarity can still surface a conceptually related memory.
+        lexical_score = phrase_bonus + (matched_count * 5)
+        semantic_component = max(semantic_score or 0.0, 0.0) * 100
+        score = lexical_score + semantic_component
+        ranked.append((score, semantic_score or 0.0, capture))
 
     ranked.sort(
         key=lambda item: (
             item[0],
-            item[1].created_at,
-            str(item[1].id),
+            item[1],
+            item[2].created_at,
+            str(item[2].id),
         ),
         reverse=True,
     )
-    return [capture for _, capture in ranked[:SEARCH_RESULT_LIMIT]]
+    return [capture for _, _, capture in ranked[:SEARCH_RESULT_LIMIT]]
 
 
 def _source_metadata(message: Any) -> dict[str, Any]:
@@ -177,6 +302,8 @@ async def process_discord_message(
     message: Any,
     settings: Settings,
     session_factory: sessionmaker[Session],
+    provider: EnrichmentProvider | None = None,
+    enrichment_scheduler: EnrichmentScheduler | None = None,
 ) -> None:
     """Handle one Discord message while keeping capture persistence synchronous and durable."""
 
@@ -221,11 +348,12 @@ async def process_discord_message(
 
         if command is not None:
             command_name, _ = command
+            retry_capture: Capture | None = None
             if command_name in {"/start", "/help"}:
                 response_text = (
                     "Send me any text and I’ll save it. Use /recent to review "
-                    "captures, /ask <query> to search, or /undo to remove the "
-                    "latest one."
+                    "captures, /ask <query> to search, /retry to reprocess a "
+                    "failed capture, or /undo to remove the latest one."
                 )
             elif command_name == "/recent":
                 captures = list(
@@ -261,19 +389,47 @@ async def process_discord_message(
                 if not command[1]:
                     response_text = "Usage: /ask <query>. Example: /ask electrician"
                 else:
+                    query_embedding: list[float] | None = None
+                    if provider is not None:
+                        try:
+                            query_embedding = await asyncio.to_thread(provider.embed, command[1])
+                        except Exception:
+                            logger.exception(
+                                "Semantic query embedding failed; using lexical search"
+                            )
                     matches = _search_captures(
                         session,
                         conversation_id=message.channel.id,
                         query=command[1],
+                        query_embedding=query_embedding,
                     )
                     response_text = _format_search_results(matches, command[1])
+            elif command_name == "/retry":
+                retry_capture = session.scalar(
+                    select(Capture)
+                    .where(
+                        Capture.platform == PLATFORM,
+                        Capture.conversation_id == message.channel.id,
+                        Capture.deleted_at.is_(None),
+                        Capture.processing_status == "failed",
+                    )
+                    .order_by(Capture.created_at.desc(), Capture.id.desc())
+                    .limit(1)
+                )
+                if retry_capture is None:
+                    response_text = "No failed captures need retrying."
+                else:
+                    response_text = f"Retrying enrichment for: {retry_capture.raw_text}"
             else:
                 response_text = (
                     "I don’t recognize that command yet. Send text to save it, "
-                    "or use /recent and /undo."
+                    "or use /recent, /ask, /retry, and /undo."
                 )
             session.commit()
             await _send_ack(message, response_text)
+            if command_name == "/retry" and retry_capture is not None:
+                if enrichment_scheduler is not None:
+                    enrichment_scheduler(retry_capture.id)
             return
 
         if not text.strip():
@@ -302,6 +458,8 @@ async def process_discord_message(
             return
 
         await _send_ack(message, f"Saved: {text}")
+        if enrichment_scheduler is not None:
+            enrichment_scheduler(capture.id)
     finally:
         session.close()
 
@@ -317,9 +475,71 @@ class PersonalInboxDiscordClient(discord.Client):
         super().__init__(intents=intents)
         self.settings = settings
         self.session_factory = session_factory
+        self.provider: EnrichmentProvider | None = None
+        if settings.openai_api_key is not None and settings.openai_api_key.get_secret_value():
+            try:
+                self.provider = OpenAIProvider(settings)
+            except Exception:
+                logger.exception("OpenAI enrichment is unavailable; captures will remain durable")
+        self._enrichment_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
+
+    def schedule_enrichment(self, capture_id: uuid.UUID) -> None:
+        """Queue enrichment in-process while retaining durable DB state."""
+
+        if self.provider is None:
+            logger.warning("Skipping enrichment because OPENAI_API_KEY is not configured")
+            return
+        current_task = self._enrichment_tasks.get(capture_id)
+        if current_task is not None and not current_task.done():
+            return
+        task = asyncio.create_task(
+            enrich_capture(
+                capture_id,
+                settings=self.settings,
+                session_factory=self.session_factory,
+                provider=self.provider,
+            )
+        )
+        self._enrichment_tasks[capture_id] = task
+
+        def _forget(done_task: asyncio.Task[None]) -> None:
+            if self._enrichment_tasks.get(capture_id) is done_task:
+                self._enrichment_tasks.pop(capture_id, None)
+            if not done_task.cancelled():
+                exception = done_task.exception()
+                if exception is not None:
+                    logger.error(
+                        "Enrichment task crashed",
+                        exc_info=(type(exception), exception, exception.__traceback__),
+                    )
+
+        task.add_done_callback(_forget)
+
+    def recover_pending_enrichment(self) -> None:
+        """Resume captures left pending by a restart, up to the retry budget."""
+
+        if self.provider is None:
+            return
+        session = self.session_factory()
+        try:
+            capture_ids = pending_capture_ids(
+                session,
+                max_attempts=self.settings.enrichment_max_attempts,
+            )
+        finally:
+            session.close()
+        for capture_id in capture_ids:
+            self.schedule_enrichment(capture_id)
 
     async def on_ready(self) -> None:
         logger.info("Discord bot connected as %s", self.user)
+        self.recover_pending_enrichment()
 
     async def on_message(self, message: discord.Message) -> None:
-        await process_discord_message(message, self.settings, self.session_factory)
+        await process_discord_message(
+            message,
+            self.settings,
+            self.session_factory,
+            provider=self.provider,
+            enrichment_scheduler=self.schedule_enrichment,
+        )

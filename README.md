@@ -6,7 +6,7 @@ The product requirements are in [PRD.md](PRD.md), and the implementation plan is
 
 ## Current status
 
-The repository currently contains the development scaffold and the first product slice. It includes:
+The repository contains the development scaffold and the first three product slices. It includes:
 
 - FastAPI application with liveness and database-readiness endpoints
 - Discord Gateway bot for private DM capture
@@ -17,7 +17,10 @@ The repository currently contains the development scaffold and the first product
 - A first migration that enables pgvector
 
 Vertical Slices 1 and 2—private Discord text capture and exact text retrieval—
-are implemented. The next product slice is semantic memory and hybrid retrieval.
+are implemented, and Slice 3 adds semantic memory and hybrid retrieval. New
+text captures are acknowledged first, then enriched asynchronously with
+normalized text, a summary, type, topics, entities, and an embedding. The
+original capture is retained when the provider fails.
 
 ## Requirements
 
@@ -53,6 +56,19 @@ Install the bot into a private server using the application's Installation or
 OAuth2 install link, then open a direct message with the bot. V1 ignores
 messages posted in server channels. Keep the bot token private.
 
+For semantic enrichment, create an OpenAI API key and set `OPENAI_API_KEY` in
+`.env`. The defaults are intentionally explicit and economical:
+
+```text
+OPENAI_MODEL=gpt-5.6-luna
+OPENAI_EMBEDDING_MODEL=text-embedding-3-small
+OPENAI_EMBEDDING_DIMENSIONS=1536
+```
+
+The model settings may be overridden for experiments, but the database schema
+expects 1,536-dimensional embeddings. If the API key is unavailable, captures
+are still saved and `/ask` falls back to exact lexical search.
+
 Start the API (optional health/readiness server):
 
 ```bash
@@ -75,6 +91,9 @@ make bot
 The bot maintains a Discord Gateway connection, so it does not require a
 public HTTPS webhook URL. Send it a direct message from the allowlisted
 Discord account. V1 ignores messages posted in server channels.
+
+Use `/recent` to inspect processing states. A failed item can be retried with
+`/retry`; pending captures are also resumed automatically when the bot restarts.
 
 Run checks:
 
