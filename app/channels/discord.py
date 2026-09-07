@@ -24,6 +24,40 @@ TOKEN_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
 ISO_DATE_PATTERN = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 SEMANTIC_MIN_SIMILARITY = 0.30
 EnrichmentScheduler = Callable[[uuid.UUID], None]
+SEARCH_STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "did",
+    "do",
+    "does",
+    "for",
+    "have",
+    "i",
+    "in",
+    "is",
+    "it",
+    "me",
+    "my",
+    "of",
+    "the",
+    "to",
+    "was",
+    "what",
+    "when",
+    "where",
+    "which",
+    "who",
+    "why",
+    "with",
+    "you",
+}
+RETRIEVAL_CAPTURE_PATTERN = re.compile(
+    r"\b(?:what|where|when|which|who|how|did|do|does|have|has|can|show|list|find|tell)\b"
+    r".*\b(?:save|saved|capture|captures|memory|memories|note|notes|stored|sent)\b",
+    re.IGNORECASE,
+)
 
 
 def _parse_command(text: str) -> tuple[str, str] | None:
@@ -67,9 +101,24 @@ def _search_tokens(text: str) -> list[str]:
         dict.fromkeys(
             token.casefold()
             for token in TOKEN_PATTERN.findall(text)
-            if len(token) > 1
+            if len(token) > 1 and token.casefold() not in SEARCH_STOPWORDS
         )
     )
+
+
+def _is_retrieval_question_capture(capture: Capture) -> bool:
+    """Identify generic saved-inbox questions accidentally captured as notes."""
+
+    raw_text = " ".join(capture.raw_text.split())
+    inferred_type = (capture.inferred_type or "").casefold()
+    summary = (capture.summary or "").casefold()
+    if inferred_type in {"question", "query", "search"}:
+        return True
+    if "question" in summary and any(
+        keyword in summary for keyword in ("saved", "capture", "memory", "note")
+    ):
+        return True
+    return bool(RETRIEVAL_CAPTURE_PATTERN.search(raw_text))
 
 
 def _capture_source(capture: Capture) -> str:
@@ -221,6 +270,8 @@ def _search_captures(
     query_text = " ".join(tokens)
     ranked: list[tuple[float, float, Capture]] = []
     for capture in candidates:
+        if _is_retrieval_question_capture(capture):
+            continue
         searchable_text = " ".join(
             part
             for part in (

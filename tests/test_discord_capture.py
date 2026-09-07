@@ -336,6 +336,35 @@ def test_ask_uses_semantic_matches_and_keeps_exact_matches_strong(
     assert [capture.external_message_id for capture in matches] == [61, 60]
 
 
+def test_ask_excludes_generic_saved_questions_from_semantic_results(
+    session_factory: sessionmaker[Session],
+) -> None:
+    recommendation = FakeMessage(65, "A friend recommended a ramen restaurant near F7")
+    generic_question = FakeMessage(66, "What have I saved?")
+    run_message(recommendation, session_factory)
+    run_message(generic_question, session_factory)
+    with session_factory() as session:
+        first = session.scalar(select(Capture).where(Capture.external_message_id == 65))
+        second = session.scalar(select(Capture).where(Capture.external_message_id == 66))
+        assert first is not None and second is not None
+        first.normalized_text = "friend recommended Japanese noodles"
+        first.summary = "Recommendation for a ramen restaurant near F7 from a friend."
+        first.embedding = [0.95, 0.31]
+        second.normalized_text = "question about saved items"
+        second.summary = "A question asking to review saved items."
+        second.embedding = [0.93, 0.37]
+        session.commit()
+
+        matches = _search_captures(
+            session,
+            conversation_id=456,
+            query="what did my friend recommend?",
+            query_embedding=[1.0, 0.0],
+        )
+
+    assert [capture.external_message_id for capture in matches] == [65]
+
+
 def test_date_sensitive_search_filters_by_saved_date(
     session_factory: sessionmaker[Session],
 ) -> None:
