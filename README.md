@@ -16,8 +16,8 @@ The repository currently contains the development scaffold and the first product
 - Pytest and Ruff configuration
 - A first migration that enables pgvector
 
-Vertical Slice 1—private Discord text capture—is implemented. The next product
-slice is exact text retrieval through `/ask`.
+Vertical Slices 1 and 2—private Discord text capture and exact text retrieval—
+are implemented. The next product slice is semantic memory and hybrid retrieval.
 
 ## Requirements
 

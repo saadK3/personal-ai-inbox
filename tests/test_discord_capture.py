@@ -123,3 +123,53 @@ def test_commands_and_unsupported_messages_are_not_saved(
         assert session.scalar(select(Capture.id)) is None
         assert len(list(session.scalars(select(MessageReceipt)))) == 3
     assert len(channel.sent_messages) == 3
+
+
+def test_ask_returns_ranked_matches_with_source_and_excludes_deleted(
+    session_factory: sessionmaker[Session],
+) -> None:
+    first = FakeMessage(30, "Call the electrician about the kitchen lights")
+    second = FakeMessage(31, "Electrician recommended a good hardware store")
+    unrelated = FakeMessage(32, "Book a dentist appointment")
+    query = FakeMessage(33, "/ask electrician")
+
+    run_message(first, session_factory)
+    run_message(second, session_factory)
+    run_message(unrelated, session_factory)
+    run_message(query, session_factory)
+
+    response = query.channel.sent_messages[-1]
+    assert 'Matches for "electrician":' in response
+    assert "Call the electrician about the kitchen lights" in response
+    assert "Electrician recommended a good hardware store" in response
+    assert "Book a dentist appointment" not in response
+    assert "https://discord.com/channels/@me/456/30" in response
+
+    with session_factory() as session:
+        capture = session.scalar(select(Capture).where(Capture.external_message_id == 30))
+        assert capture is not None
+        capture.deleted_at = capture.created_at
+        session.commit()
+
+    deleted_query = FakeMessage(34, "/ask electrician")
+    run_message(deleted_query, session_factory)
+    deleted_response = deleted_query.channel.sent_messages[-1]
+    assert "Call the electrician about the kitchen lights" not in deleted_response
+    assert "Electrician recommended a good hardware store" in deleted_response
+
+
+def test_ask_handles_no_results_and_missing_query(
+    session_factory: sessionmaker[Session],
+) -> None:
+    no_result = FakeMessage(40, "/ask something I never saved")
+    missing_query = FakeMessage(41, "/ask")
+
+    run_message(no_result, session_factory)
+    run_message(missing_query, session_factory)
+
+    assert no_result.channel.sent_messages == [
+        'No saved captures matched "something I never saved".'
+    ]
+    assert missing_query.channel.sent_messages == [
+        "Usage: /ask <query>. Example: /ask electrician"
+    ]
