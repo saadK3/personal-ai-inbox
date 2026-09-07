@@ -7,7 +7,7 @@ from types import SimpleNamespace
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
-from app.channels.discord import _search_captures, process_discord_message
+from app.channels.discord import _route_message, _search_captures, process_discord_message
 from app.core.config import Settings
 from app.models import Capture, MessageReceipt
 from app.providers.openai import EnrichmentResult, OpenAIProvider
@@ -151,6 +151,73 @@ def test_commands_and_unsupported_messages_are_not_saved(
         assert session.scalar(select(Capture.id)) is None
         assert len(list(session.scalars(select(MessageReceipt)))) == 3
     assert len(channel.sent_messages) == 3
+
+
+def test_natural_router_keeps_ambiguous_and_idea_questions_safe() -> None:
+    assert _route_message("/ask electrician") == "command"
+    assert _route_message("What restaurant did my friend recommend?") == "query"
+    assert _route_message("Did I save anything about Norway?") == "query"
+    assert _route_message("What if I built an AI inbox?") == "capture"
+    assert _route_message("What should I eat tonight?") == "capture"
+    assert _route_message("What do you recommend?") == "capture"
+    assert _route_message("Remember to buy milk") == "capture"
+
+
+def test_natural_query_searches_without_saving_the_question(
+    session_factory: sessionmaker[Session],
+) -> None:
+    saved = FakeMessage(25, "A friend recommended a ramen restaurant near F7")
+    run_message(saved, session_factory)
+    with session_factory() as session:
+        capture = session.scalar(select(Capture).where(Capture.external_message_id == 25))
+        assert capture is not None
+        capture.normalized_text = "friend recommended Japanese noodles"
+        capture.summary = "Recommendation for a ramen restaurant near F7."
+        capture.embedding = [1.0, 0.0]
+        session.commit()
+
+    natural_query = FakeMessage(26, "What restaurant did my friend recommend?")
+    asyncio.run(
+        process_discord_message(
+            natural_query,
+            Settings(discord_allowed_user_id=123),
+            session_factory,
+            provider=FakeProvider(),
+        )
+    )
+
+    response = natural_query.channel.sent_messages[-1]
+    assert response.startswith("Search only — this message was not saved.")
+    assert "A friend recommended a ramen restaurant near F7" in response
+    with session_factory() as session:
+        assert len(list(session.scalars(select(Capture)))) == 1
+        assert len(list(session.scalars(select(MessageReceipt)))) == 2
+
+
+def test_idea_question_is_saved_and_save_command_provides_recovery(
+    session_factory: sessionmaker[Session],
+) -> None:
+    idea = FakeMessage(27, "What if I built an AI inbox?")
+    run_message(idea, session_factory)
+    assert idea.channel.sent_messages == ["Saved: What if I built an AI inbox?"]
+
+    question = FakeMessage(28, "What restaurant did my friend recommend?")
+    run_message(question, session_factory)
+    assert question.channel.sent_messages[-1].startswith(
+        "Search only — this message was not saved."
+    )
+
+    recovered = FakeMessage(29, "/save What restaurant did my friend recommend?")
+    run_message(recovered, session_factory)
+    assert recovered.channel.sent_messages == [
+        "Saved: What restaurant did my friend recommend?"
+    ]
+    with session_factory() as session:
+        raw_texts = list(session.scalars(select(Capture.raw_text).order_by(Capture.created_at)))
+        assert raw_texts == [
+            "What if I built an AI inbox?",
+            "What restaurant did my friend recommend?",
+        ]
 
 
 def test_ask_returns_ranked_matches_with_source_and_excludes_deleted(
@@ -340,7 +407,7 @@ def test_ask_excludes_generic_saved_questions_from_semantic_results(
     session_factory: sessionmaker[Session],
 ) -> None:
     recommendation = FakeMessage(65, "A friend recommended a ramen restaurant near F7")
-    generic_question = FakeMessage(66, "What have I saved?")
+    generic_question = FakeMessage(66, "/save What have I saved?")
     run_message(recommendation, session_factory)
     run_message(generic_question, session_factory)
     with session_factory() as session:

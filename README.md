@@ -6,7 +6,7 @@ The product requirements are in [PRD.md](PRD.md), and the implementation plan is
 
 ## Current status
 
-The repository contains the development scaffold and the first three product slices. It includes:
+The repository contains the development scaffold and the first four product slices. It includes:
 
 - FastAPI application with liveness and database-readiness endpoints
 - Discord Gateway bot for private DM capture
@@ -17,10 +17,13 @@ The repository contains the development scaffold and the first three product sli
 - A first migration that enables pgvector
 
 Vertical Slices 1 and 2—private Discord text capture and exact text retrieval—
-are implemented, and Slice 3 adds semantic memory and hybrid retrieval. New
-text captures are acknowledged first, then enriched asynchronously with
-normalized text, a summary, type, topics, entities, and an embedding. The
-original capture is retained when the provider fails.
+are implemented, Slice 3 adds semantic memory and hybrid retrieval, and Slice 4
+adds natural save/query routing. New text captures are acknowledged first, then
+enriched asynchronously with normalized text, a summary, type, topics,
+entities, and an embedding. Clear questions about saved memories can be asked
+without `/ask`; uncertain or idea-shaped questions remain captures. The
+`/save <text>` command provides an explicit recovery path when a message should
+be saved. The original capture is retained when the provider fails.
 
 ## Requirements
 
@@ -67,7 +70,8 @@ OPENAI_EMBEDDING_DIMENSIONS=1536
 
 The model settings may be overridden for experiments, but the database schema
 expects 1,536-dimensional embeddings. If the API key is unavailable, captures
-are still saved and `/ask` falls back to exact lexical search.
+are still saved and `/ask` plus natural memory questions fall back to exact
+lexical search.
 
 Start the API (optional health/readiness server):
 
@@ -94,6 +98,8 @@ Discord account. V1 ignores messages posted in server channels.
 
 Use `/recent` to inspect processing states. A failed item can be retried with
 `/retry`; pending captures are also resumed automatically when the bot restarts.
+Use `/ask <query>` for explicit retrieval, ask a clear memory question in plain
+language, or use `/save <text>` to force a message to be stored.
 
 Run checks:
 

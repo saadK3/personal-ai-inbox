@@ -4,7 +4,7 @@ import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Any
+from typing import Any, Literal
 
 import discord
 from sqlalchemy import or_, select
@@ -24,6 +24,7 @@ TOKEN_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
 ISO_DATE_PATTERN = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 SEMANTIC_MIN_SIMILARITY = 0.30
 EnrichmentScheduler = Callable[[uuid.UUID], None]
+MessageRoute = Literal["command", "query", "capture"]
 SEARCH_STOPWORDS = {
     "a",
     "an",
@@ -58,6 +59,36 @@ RETRIEVAL_CAPTURE_PATTERN = re.compile(
     r".*\b(?:save|saved|capture|captures|memory|memories|note|notes|stored|sent)\b",
     re.IGNORECASE,
 )
+QUESTION_PREFIX_PATTERN = re.compile(
+    r"^(?:what|where|when|which|who|whom|why|how|did|do|does|is|are|have|has|can|could|would|should|show|find|list|tell)\b",
+    re.IGNORECASE,
+)
+HYPOTHETICAL_PREFIX_PATTERN = re.compile(
+    r"^(?:what if|if i|should i build|could i build|would it be|idea:|thinking of)\b",
+    re.IGNORECASE,
+)
+MEMORY_CUE_PATTERN = re.compile(
+    r"\b(?:save|saved|sent|stored|bookmarked|capture|captured|memory|memories|"
+    r"my notes|my captures)\b",
+    re.IGNORECASE,
+)
+RECALL_ACTION_PATTERN = re.compile(
+    r"\b(?:recommend(?:ed|ation)?|mention(?:ed)?|said|say|wanted to try|looked at|watched)\b",
+    re.IGNORECASE,
+)
+RECALL_CONTEXT_PATTERN = re.compile(
+    r"\b(?:what was that|what did(?:\s+\w+){0,4}\s+(?:say|mention|recommend)|"
+    r"where did i|when did i|who did i)\b",
+    re.IGNORECASE,
+)
+DATE_CUE_PATTERN = re.compile(
+    r"\b(?:today|yesterday|this week|last week|this month|last month|a few weeks ago|recently)\b",
+    re.IGNORECASE,
+)
+ADVICE_QUESTION_PATTERN = re.compile(
+    r"^(?:what|where|how)\s+(?:should|could|would|can|do)\s+(?:i|you)\b|^what\s+(?:do|would|should)\s+you\s+recommend\b",
+    re.IGNORECASE,
+)
 
 
 def _parse_command(text: str) -> tuple[str, str] | None:
@@ -66,6 +97,48 @@ def _parse_command(text: str) -> tuple[str, str] | None:
         return None
     command, _, argument = stripped.partition(" ")
     return command.lower(), argument.strip()
+
+
+def _is_natural_query(text: str) -> bool:
+    """Return true only for high-confidence questions about saved memories."""
+
+    stripped = " ".join(text.split())
+    if not stripped or stripped.startswith("/"):
+        return False
+    if HYPOTHETICAL_PREFIX_PATTERN.match(stripped):
+        return False
+    if not QUESTION_PREFIX_PATTERN.match(stripped):
+        return False
+    if ADVICE_QUESTION_PATTERN.match(stripped):
+        return False
+    if MEMORY_CUE_PATTERN.search(stripped):
+        return True
+    has_recall_context = bool(RECALL_CONTEXT_PATTERN.search(stripped))
+    has_recall_action = bool(RECALL_ACTION_PATTERN.search(stripped))
+    has_past_marker = bool(
+        re.search(
+            r"\b(?:did|was|were|have|has|sent|mentioned|recommended|said|ago)\b",
+            stripped,
+            re.I,
+        )
+    )
+    if has_recall_context:
+        return True
+    if has_recall_action and has_past_marker:
+        return True
+    return bool(DATE_CUE_PATTERN.search(stripped)) and bool(
+        re.search(r"\b(?:my|i|from)\b", stripped, re.I)
+    )
+
+
+def _route_message(text: str) -> MessageRoute:
+    """Classify a message while preserving capture as the safe default."""
+
+    if _parse_command(text) is not None:
+        return "command"
+    if _is_natural_query(text):
+        return "query"
+    return "capture"
 
 
 def _truncate(text: str, limit: int = DISCORD_MESSAGE_LIMIT) -> str:
@@ -317,6 +390,39 @@ def _search_captures(
     return [capture for _, _, capture in ranked[:SEARCH_RESULT_LIMIT]]
 
 
+async def _run_search(
+    session: Session,
+    conversation_id: int,
+    query: str,
+    provider: EnrichmentProvider | None,
+) -> list[Capture]:
+    """Run semantic search when available and safely fall back to lexical search."""
+
+    query_embedding: list[float] | None = None
+    if provider is not None:
+        try:
+            query_embedding = await asyncio.to_thread(provider.embed, query)
+        except Exception:
+            logger.exception("Semantic query embedding failed; using lexical search")
+    return _search_captures(
+        session,
+        conversation_id=conversation_id,
+        query=query,
+        query_embedding=query_embedding,
+    )
+
+
+def _format_natural_query_results(captures: list[Capture], query: str) -> str:
+    """Make the route visible and provide a recovery path if routing was wrong."""
+
+    body = _format_search_results(captures, query)
+    prefix = (
+        "Search only — this message was not saved. "
+        "To save it instead, send `/save <text>`.\n"
+    )
+    return _truncate(prefix + body)
+
+
 def _source_metadata(message: Any) -> dict[str, Any]:
     return {
         "platform": PLATFORM,
@@ -400,11 +506,14 @@ async def process_discord_message(
         if command is not None:
             command_name, _ = command
             retry_capture: Capture | None = None
+            save_capture: Capture | None = None
             if command_name in {"/start", "/help"}:
                 response_text = (
-                    "Send me any text and I’ll save it. Use /recent to review "
-                    "captures, /ask <query> to search, /retry to reprocess a "
-                    "failed capture, or /undo to remove the latest one."
+                    "Send me a note and I’ll save it, or ask a clear question "
+                    "naturally to search. Use /recent to review captures, "
+                    "/ask <query> to search explicitly, /save <text> to force "
+                    "a save, /retry to reprocess a failed capture, or /undo "
+                    "to remove the latest one."
                 )
             elif command_name == "/recent":
                 captures = list(
@@ -440,21 +549,27 @@ async def process_discord_message(
                 if not command[1]:
                     response_text = "Usage: /ask <query>. Example: /ask electrician"
                 else:
-                    query_embedding: list[float] | None = None
-                    if provider is not None:
-                        try:
-                            query_embedding = await asyncio.to_thread(provider.embed, command[1])
-                        except Exception:
-                            logger.exception(
-                                "Semantic query embedding failed; using lexical search"
-                            )
-                    matches = _search_captures(
+                    matches = await _run_search(
                         session,
                         conversation_id=message.channel.id,
                         query=command[1],
-                        query_embedding=query_embedding,
+                        provider=provider,
                     )
                     response_text = _format_search_results(matches, command[1])
+            elif command_name == "/save":
+                if not command[1]:
+                    response_text = "Usage: /save <text>. Example: /save buy milk"
+                else:
+                    save_capture = Capture(
+                        platform=PLATFORM,
+                        external_message_id=message.id,
+                        conversation_id=message.channel.id,
+                        sender_id=message.author.id,
+                        raw_text=command[1],
+                        source_metadata=_source_metadata(message),
+                    )
+                    session.add(save_capture)
+                    response_text = f"Saved: {command[1]}"
             elif command_name == "/retry":
                 retry_capture = session.scalar(
                     select(Capture)
@@ -474,13 +589,32 @@ async def process_discord_message(
             else:
                 response_text = (
                     "I don’t recognize that command yet. Send text to save it, "
-                    "or use /recent, /ask, /retry, and /undo."
+                    "or use /recent, /ask, /save, /retry, and /undo."
                 )
-            session.commit()
+            try:
+                session.commit()
+                if save_capture is not None:
+                    session.refresh(save_capture)
+            except IntegrityError:
+                session.rollback()
+                return
             await _send_ack(message, response_text)
+            if save_capture is not None and enrichment_scheduler is not None:
+                enrichment_scheduler(save_capture.id)
             if command_name == "/retry" and retry_capture is not None:
                 if enrichment_scheduler is not None:
                     enrichment_scheduler(retry_capture.id)
+            return
+
+        if _is_natural_query(text):
+            matches = await _run_search(
+                session,
+                conversation_id=message.channel.id,
+                query=text,
+                provider=provider,
+            )
+            session.commit()
+            await _send_ack(message, _format_natural_query_results(matches, text))
             return
 
         if not text.strip():
