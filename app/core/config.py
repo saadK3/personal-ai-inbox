@@ -18,6 +18,7 @@ class Settings(BaseSettings):
     openai_model: str = "gpt-5.6-luna"
     openai_embedding_model: str = "text-embedding-3-small"
     openai_embedding_dimensions: int = 1536
+    openai_transcription_model: str = "gpt-4o-mini-transcribe"
     enrichment_max_attempts: int = 3
     storage_dir: Path = Path("./data")
 

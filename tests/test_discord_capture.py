@@ -2,6 +2,7 @@ import asyncio
 import json
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 from sqlalchemy import select
@@ -11,7 +12,13 @@ from app.channels.discord import _route_message, _search_captures, process_disco
 from app.core.config import Settings
 from app.models import Capture, MessageReceipt
 from app.providers.openai import EnrichmentResult, OpenAIProvider
-from app.workers.enrichment import enrich_capture
+from app.workers.enrichment import (
+    TRANSCRIPTION_FAILED_STATUS,
+    TRANSCRIPTION_PENDING_STATUS,
+    TRANSCRIPTION_UNSUPPORTED_STATUS,
+    enrich_capture,
+    transcribe_capture,
+)
 
 
 @dataclass
@@ -39,11 +46,23 @@ class FakeMessage:
     attachments: list[object] = field(default_factory=list)
 
 
+@dataclass
+class FakeAttachment:
+    id: int = 900
+    filename: str = "voice-note.ogg"
+    content_type: str | None = "audio/ogg"
+    size: int = 128
+    url: str = "https://cdn.discordapp.com/attachments/900/voice-note.ogg"
+
+
 class FakeProvider:
     def __init__(self, *, should_fail: bool = False) -> None:
         self.should_fail = should_fail
+        self.transcription_should_fail = False
+        self.transcript = "Remember to book the dentist next Tuesday"
         self.enrich_calls: list[str] = []
         self.embed_calls: list[str] = []
+        self.transcribe_calls: list[Path] = []
 
     def enrich(self, raw_text: str) -> EnrichmentResult:
         self.enrich_calls.append(raw_text)
@@ -60,6 +79,12 @@ class FakeProvider:
     def embed(self, text: str) -> list[float]:
         self.embed_calls.append(text)
         return [1.0, 0.0]
+
+    def transcribe(self, audio_path: Path) -> str:
+        self.transcribe_calls.append(audio_path)
+        if self.transcription_should_fail:
+            raise RuntimeError("transcription provider unavailable")
+        return self.transcript
 
 
 def run_message(
@@ -161,6 +186,194 @@ def test_natural_router_keeps_ambiguous_and_idea_questions_safe() -> None:
     assert _route_message("What should I eat tonight?") == "capture"
     assert _route_message("What do you recommend?") == "capture"
     assert _route_message("Remember to buy milk") == "capture"
+
+
+def test_voice_note_is_persisted_before_transcription_and_scheduled(
+    session_factory: sessionmaker[Session],
+) -> None:
+    message = FakeMessage(23, "", attachments=[FakeAttachment()])
+    scheduled: list[object] = []
+    asyncio.run(
+        process_discord_message(
+            message,
+            Settings(discord_allowed_user_id=123),
+            session_factory,
+            transcription_scheduler=scheduled.append,
+        )
+    )
+
+    assert message.channel.sent_messages == [
+        "Voice note saved; transcription started in the background."
+    ]
+    with session_factory() as session:
+        capture = session.scalar(select(Capture).where(Capture.external_message_id == 23))
+        assert capture is not None
+        assert capture.source_type == "voice"
+        assert capture.raw_text == "[Voice note: voice-note.ogg]"
+        assert capture.raw_transcription is None
+        assert capture.processing_status == TRANSCRIPTION_PENDING_STATUS
+        assert capture.source_metadata["audio"]["url"].endswith("voice-note.ogg")
+        assert scheduled == [capture.id]
+
+
+def test_unsupported_voice_format_is_saved_with_clear_status(
+    session_factory: sessionmaker[Session],
+) -> None:
+    message = FakeMessage(
+        24,
+        "",
+        attachments=[FakeAttachment(filename="recording.xyz", content_type="audio/x-unknown")],
+    )
+    scheduled: list[object] = []
+    asyncio.run(
+        process_discord_message(
+            message,
+            Settings(discord_allowed_user_id=123),
+            session_factory,
+            transcription_scheduler=scheduled.append,
+        )
+    )
+
+    assert message.channel.sent_messages == [
+        "Voice note saved, but I can’t transcribe it: unsupported audio format (recording.xyz)."
+    ]
+    with session_factory() as session:
+        capture = session.scalar(select(Capture).where(Capture.external_message_id == 24))
+        assert capture is not None
+        assert capture.processing_status == TRANSCRIPTION_UNSUPPORTED_STATUS
+        assert capture.processing_error == "unsupported audio format (recording.xyz)"
+        assert scheduled == []
+
+
+def _add_voice_capture(
+    session_factory: sessionmaker[Session],
+    *,
+    message_id: int,
+    audio_path: Path,
+) -> object:
+    with session_factory() as session:
+        capture = Capture(
+            platform="discord",
+            external_message_id=message_id,
+            conversation_id=456,
+            sender_id=123,
+            source_type="voice",
+            raw_text="[Voice note: voice-note.ogg]",
+            source_metadata={
+                "audio": {
+                    "filename": "voice-note.ogg",
+                    "content_type": "audio/ogg",
+                    "url": "https://cdn.discordapp.com/voice-note.ogg",
+                    "local_path": str(audio_path),
+                }
+            },
+            processing_status=TRANSCRIPTION_PENDING_STATUS,
+        )
+        session.add(capture)
+        session.commit()
+        return capture.id
+
+
+def test_voice_transcription_is_retained_and_searchable(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "voice-note.ogg"
+    audio_path.write_bytes(b"fake audio")
+    capture_id = _add_voice_capture(session_factory, message_id=26, audio_path=audio_path)
+    provider = FakeProvider()
+    settings = Settings(discord_allowed_user_id=123, storage_dir=tmp_path)
+
+    assert asyncio.run(transcribe_capture(capture_id, settings, session_factory, provider)) is True
+    with session_factory() as session:
+        capture = session.get(Capture, capture_id)
+        assert capture is not None
+        assert capture.processing_status == "captured"
+        assert capture.raw_text == provider.transcript
+        assert capture.raw_transcription == provider.transcript
+        assert capture.transcription_attempts == 1
+        assert provider.transcribe_calls == [audio_path]
+
+    assert asyncio.run(enrich_capture(capture_id, settings, session_factory, provider)) is True
+    query = FakeMessage(36, "Did I save anything about the dentist?")
+    asyncio.run(
+        process_discord_message(
+            query,
+            settings,
+            session_factory,
+            provider=provider,
+        )
+    )
+    assert provider.embed_calls[-1] == "Did I save anything about the dentist?"
+    assert provider.transcript in query.channel.sent_messages[-1]
+
+
+def test_failed_voice_transcription_can_retry_without_resending(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "voice-note.ogg"
+    audio_path.write_bytes(b"fake audio")
+    capture_id = _add_voice_capture(session_factory, message_id=37, audio_path=audio_path)
+    settings = Settings(discord_allowed_user_id=123, storage_dir=tmp_path)
+    failing_provider = FakeProvider()
+    failing_provider.transcription_should_fail = True
+
+    assert (
+        asyncio.run(
+            transcribe_capture(capture_id, settings, session_factory, failing_provider)
+        )
+        is False
+    )
+    with session_factory() as session:
+        failed = session.get(Capture, capture_id)
+        assert failed is not None
+        assert failed.processing_status == TRANSCRIPTION_FAILED_STATUS
+        assert failed.processing_error == "transcription provider unavailable"
+        assert failed.transcription_attempts == 1
+
+    scheduled: list[object] = []
+    retry = FakeMessage(38, "/retry")
+    asyncio.run(
+        process_discord_message(
+            retry,
+            settings,
+            session_factory,
+            transcription_scheduler=scheduled.append,
+        )
+    )
+    assert retry.channel.sent_messages == ["Retrying transcription for: voice-note.ogg"]
+    assert scheduled == [capture_id]
+
+    assert (
+        asyncio.run(transcribe_capture(capture_id, settings, session_factory, FakeProvider()))
+        is True
+    )
+    with session_factory() as session:
+        retried = session.get(Capture, capture_id)
+        assert retried is not None
+        assert retried.processing_status == "captured"
+        assert retried.transcription_attempts == 2
+
+
+def test_empty_voice_file_reports_a_transcription_failure(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    audio_path = tmp_path / "empty.ogg"
+    audio_path.touch()
+    capture_id = _add_voice_capture(session_factory, message_id=39, audio_path=audio_path)
+    settings = Settings(discord_allowed_user_id=123, storage_dir=tmp_path)
+
+    assert (
+        asyncio.run(transcribe_capture(capture_id, settings, session_factory, FakeProvider()))
+        is False
+    )
+    with session_factory() as session:
+        capture = session.get(Capture, capture_id)
+        assert capture is not None
+        assert capture.processing_status == TRANSCRIPTION_FAILED_STATUS
+        assert capture.processing_error == "The voice attachment was empty"
 
 
 def test_natural_query_searches_without_saving_the_question(
@@ -451,7 +664,7 @@ def test_date_sensitive_search_filters_by_saved_date(
     assert [capture.external_message_id for capture in matches] == [70]
 
 
-def test_openai_provider_passes_explicit_economical_models() -> None:
+def test_openai_provider_passes_explicit_economical_models(tmp_path: Path) -> None:
     class FakeResponses:
         def __init__(self) -> None:
             self.kwargs: dict[str, object] = {}
@@ -484,15 +697,33 @@ def test_openai_provider_passes_explicit_economical_models() -> None:
             self.kwargs = kwargs
             return SimpleNamespace(data=[SimpleNamespace(embedding=[0.0] * 1536)])
 
+    class FakeTranscriptions:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, object] = {}
+
+        def create(self, **kwargs: object) -> SimpleNamespace:
+            self.kwargs = kwargs
+            return SimpleNamespace(text="A transcribed note")
+
     responses = FakeResponses()
     embeddings = FakeEmbeddings()
+    transcriptions = FakeTranscriptions()
     provider = OpenAIProvider(
         Settings(openai_api_key="test-key"),
-        client=SimpleNamespace(responses=responses, embeddings=embeddings),
+        client=SimpleNamespace(
+            responses=responses,
+            embeddings=embeddings,
+            audio=SimpleNamespace(transcriptions=transcriptions),
+        ),
     )
     provider.enrich("short note")
     provider.embed("short note")
+    audio_path = tmp_path / "note.ogg"
+    audio_path.write_bytes(b"fake audio")
+    assert provider.transcribe(audio_path) == "A transcribed note"
 
     assert responses.kwargs["model"] == "gpt-5.6-luna"
     assert embeddings.kwargs["model"] == "text-embedding-3-small"
     assert embeddings.kwargs["dimensions"] == 1536
+    assert transcriptions.kwargs["model"] == "gpt-4o-mini-transcribe"
+    assert transcriptions.kwargs["response_format"] == "text"

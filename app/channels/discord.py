@@ -4,6 +4,7 @@ import re
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
 
 import discord
@@ -14,7 +15,15 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import Settings
 from app.models.capture import Capture, MessageReceipt
 from app.providers.openai import EnrichmentProvider, OpenAIProvider
-from app.workers.enrichment import enrich_capture, pending_capture_ids
+from app.workers.enrichment import (
+    TRANSCRIPTION_FAILED_STATUS,
+    TRANSCRIPTION_PENDING_STATUS,
+    TRANSCRIPTION_UNSUPPORTED_STATUS,
+    enrich_capture,
+    pending_capture_ids,
+    pending_transcription_ids,
+    transcribe_capture,
+)
 
 logger = logging.getLogger(__name__)
 PLATFORM = "discord"
@@ -24,7 +33,31 @@ TOKEN_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
 ISO_DATE_PATTERN = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
 SEMANTIC_MIN_SIMILARITY = 0.30
 EnrichmentScheduler = Callable[[uuid.UUID], None]
+TranscriptionScheduler = Callable[[uuid.UUID], None]
 MessageRoute = Literal["command", "query", "capture"]
+SUPPORTED_AUDIO_EXTENSIONS = {
+    ".flac",
+    ".m4a",
+    ".mp3",
+    ".mp4",
+    ".mpeg",
+    ".mpga",
+    ".ogg",
+    ".wav",
+    ".webm",
+}
+SUPPORTED_AUDIO_CONTENT_TYPES = {
+    "audio/flac",
+    "audio/mp4",
+    "audio/m4a",
+    "audio/mpeg",
+    "audio/ogg",
+    "audio/opus",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/webm",
+}
+MAX_DISCORD_ATTACHMENT_BYTES = 25 * 1024 * 1024
 SEARCH_STOPWORDS = {
     "a",
     "an",
@@ -161,6 +194,8 @@ def _format_recent(captures: list[Capture]) -> str:
         if len(text) > 280:
             text = f"{text[:277]}..."
         lines.append(f"{index}. [{timestamp}] ({capture.processing_status}) {text}")
+        if capture.processing_error:
+            lines.append(f"   Error: {_truncate(capture.processing_error, 240)}")
         if len("\n".join(lines)) > DISCORD_MESSAGE_LIMIT - 20:
             lines.append("...more captures available later")
             break
@@ -196,6 +231,10 @@ def _is_retrieval_question_capture(capture: Capture) -> bool:
 
 def _capture_source(capture: Capture) -> str:
     metadata = capture.source_metadata or {}
+    if capture.source_type == "voice":
+        audio = metadata.get("audio")
+        if isinstance(audio, dict) and audio.get("url"):
+            return str(audio["url"])
     channel_id = metadata.get("channel_id")
     message_id = metadata.get("message_id")
     if capture.platform == PLATFORM and channel_id and message_id:
@@ -443,6 +482,44 @@ def _source_metadata(message: Any) -> dict[str, Any]:
     }
 
 
+def _is_voice_attachment(attachment: Any) -> bool:
+    content_type = (getattr(attachment, "content_type", None) or "").split(";", 1)[0]
+    filename = str(getattr(attachment, "filename", ""))
+    return content_type.casefold().startswith("audio/") or (
+        Path(filename).suffix.casefold() in SUPPORTED_AUDIO_EXTENSIONS
+    )
+
+
+def _voice_attachment(message: Any) -> Any | None:
+    attachments = list(getattr(message, "attachments", []) or [])
+    for attachment in attachments:
+        if _is_voice_attachment(attachment):
+            return attachment
+    return None
+
+
+def _voice_metadata(message: Any, attachment: Any) -> dict[str, Any]:
+    metadata = _source_metadata(message)
+    filename = str(getattr(attachment, "filename", "voice-note.ogg"))
+    content_type = getattr(attachment, "content_type", None)
+    size = getattr(attachment, "size", None)
+    metadata["audio"] = {
+        "id": str(getattr(attachment, "id", "")),
+        "filename": filename,
+        "content_type": content_type,
+        "size": size,
+        "url": getattr(attachment, "url", None),
+    }
+    return metadata
+
+
+def _voice_display_name(capture: Capture) -> str:
+    audio = (capture.source_metadata or {}).get("audio")
+    if isinstance(audio, dict) and audio.get("filename"):
+        return str(audio["filename"])
+    return "voice note"
+
+
 async def _send_ack(message: Any, text: str) -> bool:
     try:
         await message.channel.send(_truncate(text))
@@ -461,6 +538,7 @@ async def process_discord_message(
     session_factory: sessionmaker[Session],
     provider: EnrichmentProvider | None = None,
     enrichment_scheduler: EnrichmentScheduler | None = None,
+    transcription_scheduler: TranscriptionScheduler | None = None,
 ) -> None:
     """Handle one Discord message while keeping capture persistence synchronous and durable."""
 
@@ -577,13 +655,17 @@ async def process_discord_message(
                         Capture.platform == PLATFORM,
                         Capture.conversation_id == message.channel.id,
                         Capture.deleted_at.is_(None),
-                        Capture.processing_status == "failed",
+                        Capture.processing_status.in_({"failed", TRANSCRIPTION_FAILED_STATUS}),
                     )
                     .order_by(Capture.created_at.desc(), Capture.id.desc())
                     .limit(1)
                 )
                 if retry_capture is None:
                     response_text = "No failed captures need retrying."
+                elif retry_capture.processing_status == TRANSCRIPTION_FAILED_STATUS:
+                    response_text = (
+                        f"Retrying transcription for: {_voice_display_name(retry_capture)}"
+                    )
                 else:
                     response_text = f"Retrying enrichment for: {retry_capture.raw_text}"
             else:
@@ -602,7 +684,12 @@ async def process_discord_message(
             if save_capture is not None and enrichment_scheduler is not None:
                 enrichment_scheduler(save_capture.id)
             if command_name == "/retry" and retry_capture is not None:
-                if enrichment_scheduler is not None:
+                if (
+                    retry_capture.processing_status == TRANSCRIPTION_FAILED_STATUS
+                    and transcription_scheduler is not None
+                ):
+                    transcription_scheduler(retry_capture.id)
+                elif enrichment_scheduler is not None:
                     enrichment_scheduler(retry_capture.id)
             return
 
@@ -617,12 +704,67 @@ async def process_discord_message(
             await _send_ack(message, _format_natural_query_results(matches, text))
             return
 
+        voice_attachment = _voice_attachment(message)
+        if voice_attachment is not None:
+            filename = str(getattr(voice_attachment, "filename", "voice-note.ogg"))
+            extension = Path(filename).suffix.casefold()
+            content_type = (
+                (getattr(voice_attachment, "content_type", None) or "")
+                .split(";", 1)[0]
+                .casefold()
+            )
+            size = getattr(voice_attachment, "size", None)
+            supported_format = extension in SUPPORTED_AUDIO_EXTENSIONS or (
+                content_type in SUPPORTED_AUDIO_CONTENT_TYPES
+            )
+            unsupported_reason: str | None = None
+            if not supported_format:
+                unsupported_reason = f"unsupported audio format ({filename})"
+            elif isinstance(size, int) and size > MAX_DISCORD_ATTACHMENT_BYTES:
+                unsupported_reason = "audio attachments must be 25 MB or smaller"
+
+            voice_capture = Capture(
+                platform=PLATFORM,
+                external_message_id=message.id,
+                conversation_id=message.channel.id,
+                sender_id=message.author.id,
+                source_type="voice",
+                raw_text=f"[Voice note: {filename}]",
+                source_metadata=_voice_metadata(message, voice_attachment),
+                processing_status=(
+                    TRANSCRIPTION_UNSUPPORTED_STATUS
+                    if unsupported_reason is not None
+                    else TRANSCRIPTION_PENDING_STATUS
+                ),
+                processing_error=unsupported_reason,
+            )
+            session.add(voice_capture)
+            try:
+                session.commit()
+                session.refresh(voice_capture)
+            except IntegrityError:
+                session.rollback()
+                return
+
+            if unsupported_reason is not None:
+                response_text = (
+                    f"Voice note saved, but I can’t transcribe it: {unsupported_reason}."
+                )
+            elif transcription_scheduler is None:
+                response_text = "Voice note saved; transcription is waiting for the worker."
+            else:
+                response_text = "Voice note saved; transcription started in the background."
+            await _send_ack(message, response_text)
+            if unsupported_reason is None and transcription_scheduler is not None:
+                transcription_scheduler(voice_capture.id)
+            return
+
         if not text.strip():
             session.commit()
             await _send_ack(
                 message,
-                "I can save text messages right now. Support for voice notes, "
-                "links, and images is coming next.",
+                "I can save text messages and voice notes right now. Support for "
+                "links and images is coming next.",
             )
             return
 
@@ -667,6 +809,7 @@ class PersonalInboxDiscordClient(discord.Client):
             except Exception:
                 logger.exception("OpenAI enrichment is unavailable; captures will remain durable")
         self._enrichment_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
+        self._transcription_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
 
     def schedule_enrichment(self, capture_id: uuid.UUID) -> None:
         """Queue enrichment in-process while retaining durable DB state."""
@@ -700,6 +843,41 @@ class PersonalInboxDiscordClient(discord.Client):
 
         task.add_done_callback(_forget)
 
+    def schedule_transcription(self, capture_id: uuid.UUID) -> None:
+        """Queue voice transcription and continue into normal enrichment."""
+
+        if self.provider is None:
+            logger.warning("Skipping transcription because OPENAI_API_KEY is not configured")
+            return
+        current_task = self._transcription_tasks.get(capture_id)
+        if current_task is not None and not current_task.done():
+            return
+        task = asyncio.create_task(self._transcribe_and_enrich(capture_id))
+        self._transcription_tasks[capture_id] = task
+
+        def _forget(done_task: asyncio.Task[None]) -> None:
+            if self._transcription_tasks.get(capture_id) is done_task:
+                self._transcription_tasks.pop(capture_id, None)
+            if not done_task.cancelled():
+                exception = done_task.exception()
+                if exception is not None:
+                    logger.error(
+                        "Transcription task crashed",
+                        exc_info=(type(exception), exception, exception.__traceback__),
+                    )
+
+        task.add_done_callback(_forget)
+
+    async def _transcribe_and_enrich(self, capture_id: uuid.UUID) -> None:
+        succeeded = await transcribe_capture(
+            capture_id,
+            settings=self.settings,
+            session_factory=self.session_factory,
+            provider=self.provider,
+        )
+        if succeeded:
+            self.schedule_enrichment(capture_id)
+
     def recover_pending_enrichment(self) -> None:
         """Resume captures left pending by a restart, up to the retry budget."""
 
@@ -716,8 +894,25 @@ class PersonalInboxDiscordClient(discord.Client):
         for capture_id in capture_ids:
             self.schedule_enrichment(capture_id)
 
+    def recover_pending_transcription(self) -> None:
+        """Resume voice notes left before transcription completed."""
+
+        if self.provider is None:
+            return
+        session = self.session_factory()
+        try:
+            capture_ids = pending_transcription_ids(
+                session,
+                max_attempts=self.settings.enrichment_max_attempts,
+            )
+        finally:
+            session.close()
+        for capture_id in capture_ids:
+            self.schedule_transcription(capture_id)
+
     async def on_ready(self) -> None:
         logger.info("Discord bot connected as %s", self.user)
+        self.recover_pending_transcription()
         self.recover_pending_enrichment()
 
     async def on_message(self, message: discord.Message) -> None:
@@ -727,4 +922,5 @@ class PersonalInboxDiscordClient(discord.Client):
             self.session_factory,
             provider=self.provider,
             enrichment_scheduler=self.schedule_enrichment,
+            transcription_scheduler=self.schedule_transcription,
         )

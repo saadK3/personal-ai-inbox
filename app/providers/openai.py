@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Protocol
 
 from openai import OpenAI
@@ -39,6 +40,9 @@ class EnrichmentProvider(Protocol):
 
     def embed(self, text: str) -> list[float]:
         """Create a vector for searchable text."""
+
+    def transcribe(self, audio_path: Path) -> str:
+        """Transcribe a durable audio file."""
 
 
 ENRICHMENT_INSTRUCTIONS = """You enrich one private personal inbox capture for later search.
@@ -172,3 +176,22 @@ class OpenAIProvider:
                 f"({len(embedding)} instead of {self.settings.openai_embedding_dimensions})"
             )
         return [float(value) for value in embedding]
+
+    def transcribe(self, audio_path: Path) -> str:
+        """Transcribe one supported audio file using the configured model."""
+
+        if not audio_path.is_file() or audio_path.stat().st_size == 0:
+            raise ProviderError("Cannot transcribe a missing or empty audio file")
+        try:
+            with audio_path.open("rb") as audio_file:
+                response = self.client.audio.transcriptions.create(
+                    model=self.settings.openai_transcription_model,
+                    file=audio_file,
+                    response_format="text",
+                )
+        except Exception as exc:
+            raise ProviderError(f"Audio transcription failed: {exc}") from exc
+        text = getattr(response, "text", response if isinstance(response, str) else None)
+        if not isinstance(text, str) or not text.strip():
+            raise ProviderError("OpenAI returned an empty transcription")
+        return " ".join(text.split())
