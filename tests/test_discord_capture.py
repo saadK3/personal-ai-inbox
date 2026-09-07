@@ -616,6 +616,49 @@ def test_ask_uses_semantic_matches_and_keeps_exact_matches_strong(
     assert [capture.external_message_id for capture in matches] == [61, 60]
 
 
+def test_short_natural_queries_reject_weak_semantic_false_positives(
+    session_factory: sessionmaker[Session],
+) -> None:
+    football = FakeMessage(63, "I need to check prices of footballs around my area.")
+    electrician = FakeMessage(64, "Call the electrician about the kitchen lights")
+    run_message(football, session_factory)
+    run_message(electrician, session_factory)
+    with session_factory() as session:
+        football_capture = session.scalar(
+            select(Capture).where(Capture.external_message_id == 63)
+        )
+        electrician_capture = session.scalar(
+            select(Capture).where(Capture.external_message_id == 64)
+        )
+        assert football_capture is not None and electrician_capture is not None
+        football_capture.normalized_text = "check local football prices"
+        football_capture.summary = "Need to compare local football prices."
+        football_capture.topics = ["shopping", "footballs", "prices", "local"]
+        football_capture.embedding = [1.0, 0.0]
+        electrician_capture.normalized_text = "call electrician kitchen lights"
+        electrician_capture.summary = "Contact the electrician about the kitchen lights."
+        electrician_capture.embedding = [0.4, 0.916515]
+        session.commit()
+
+    provider = FakeProvider()
+    for message_id, query in (
+        (67, "Did I save anything about prices?"),
+        (68, "Did I save anything about football?"),
+    ):
+        query_message = FakeMessage(message_id, query)
+        asyncio.run(
+            process_discord_message(
+                query_message,
+                Settings(discord_allowed_user_id=123),
+                session_factory,
+                provider=provider,
+            )
+        )
+        response = query_message.channel.sent_messages[-1]
+        assert "I need to check prices of footballs around my area." in response
+        assert "Call the electrician about the kitchen lights" not in response
+
+
 def test_ask_excludes_generic_saved_questions_from_semantic_results(
     session_factory: sessionmaker[Session],
 ) -> None:

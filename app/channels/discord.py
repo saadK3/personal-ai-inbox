@@ -31,7 +31,8 @@ DISCORD_MESSAGE_LIMIT = 2_000
 SEARCH_RESULT_LIMIT = 5
 TOKEN_PATTERN = re.compile(r"[^\W_]+", re.UNICODE)
 ISO_DATE_PATTERN = re.compile(r"\b(20\d{2}-\d{2}-\d{2})\b")
-SEMANTIC_MIN_SIMILARITY = 0.30
+SEMANTIC_MIN_SIMILARITY = 0.55
+SHORT_QUERY_SEMANTIC_MIN_SIMILARITY = 0.65
 EnrichmentScheduler = Callable[[uuid.UUID], None]
 TranscriptionScheduler = Callable[[uuid.UUID], None]
 MessageRoute = Literal["command", "query", "capture"]
@@ -61,6 +62,7 @@ MAX_DISCORD_ATTACHMENT_BYTES = 25 * 1024 * 1024
 SEARCH_STOPWORDS = {
     "a",
     "an",
+    "about",
     "and",
     "are",
     "did",
@@ -212,6 +214,21 @@ def _search_tokens(text: str) -> list[str]:
             if len(token) > 1 and token.casefold() not in SEARCH_STOPWORDS
         )
     )
+
+
+def _token_matches(query_token: str, capture_tokens: set[str]) -> bool:
+    """Match common singular/plural forms without adding a heavyweight stemmer."""
+
+    variants = {query_token}
+    if query_token.endswith("ies") and len(query_token) > 4:
+        variants.add(f"{query_token[:-3]}y")
+    elif query_token.endswith("y") and len(query_token) > 3:
+        variants.add(f"{query_token[:-1]}ies")
+    elif query_token.endswith("s") and not query_token.endswith(("ss", "us", "is")):
+        variants.add(query_token[:-1])
+    else:
+        variants.add(f"{query_token}s")
+    return bool(variants & capture_tokens)
 
 
 def _is_retrieval_question_capture(capture: Capture) -> bool:
@@ -401,12 +418,17 @@ def _search_captures(
             if part
         )
         capture_tokens = set(_search_tokens(searchable_text))
-        matched_count = sum(token in capture_tokens for token in tokens)
+        matched_count = sum(_token_matches(token, capture_tokens) for token in tokens)
         semantic_score = _cosine_similarity(query_embedding, capture.embedding)
         if query_embedding is None and matched_count == 0:
             continue
         if query_embedding is not None and matched_count == 0:
-            if semantic_score is None or semantic_score < SEMANTIC_MIN_SIMILARITY:
+            minimum_similarity = (
+                SHORT_QUERY_SEMANTIC_MIN_SIMILARITY
+                if len(tokens) <= 1
+                else SEMANTIC_MIN_SIMILARITY
+            )
+            if semantic_score is None or semantic_score < minimum_similarity:
                 continue
         normalized_capture = " ".join(_search_tokens(searchable_text))
         phrase_bonus = 100 if query_text and query_text in normalized_capture else 0
