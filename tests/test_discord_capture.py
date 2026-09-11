@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -12,12 +13,18 @@ from app.channels.discord import _route_message, _search_captures, process_disco
 from app.core.config import Settings
 from app.models import Capture, MessageReceipt
 from app.providers.openai import EnrichmentResult, OpenAIProvider
+from app.services.webpage import WebpageMetadata
 from app.workers.enrichment import (
     TRANSCRIPTION_FAILED_STATUS,
     TRANSCRIPTION_PENDING_STATUS,
     TRANSCRIPTION_UNSUPPORTED_STATUS,
     enrich_capture,
     transcribe_capture,
+)
+from app.workers.webpage import (
+    WEB_EXTRACTION_FAILED_STATUS,
+    WEB_EXTRACTION_PENDING_STATUS,
+    extract_webpage_capture,
 )
 
 
@@ -374,6 +381,163 @@ def test_empty_voice_file_reports_a_transcription_failure(
         assert capture is not None
         assert capture.processing_status == TRANSCRIPTION_FAILED_STATUS
         assert capture.processing_error == "The voice attachment was empty"
+
+
+def test_webpage_url_is_persisted_before_extraction_and_duplicate_provenance(
+    session_factory: sessionmaker[Session],
+) -> None:
+    first = FakeMessage(42, "Read this later: https://Example.com/article/.")
+    second = FakeMessage(43, "Same page again: https://example.com/article")
+    scheduled: list[object] = []
+
+    for message in (first, second):
+        asyncio.run(
+            process_discord_message(
+                message,
+                Settings(discord_allowed_user_id=123),
+                session_factory,
+                web_extraction_scheduler=scheduled.append,
+            )
+        )
+
+    assert first.channel.sent_messages == [
+        "Saved webpage; metadata extraction started in the background."
+    ]
+    assert second.channel.sent_messages == [
+        "Saved webpage; this URL was already captured, so I kept this submission as a new "
+        "provenance record. metadata extraction started in the background."
+    ]
+    with session_factory() as session:
+        captures = list(
+            session.scalars(select(Capture).where(Capture.source_type == "webpage"))
+        )
+        assert len(captures) == 2
+        assert captures[0].raw_text == first.content
+        assert captures[0].source_metadata["url"] == "https://Example.com/article/"
+        assert captures[1].source_metadata["duplicate_of"] == str(captures[0].id)
+        assert scheduled == [captures[0].id, captures[1].id]
+
+
+def _add_webpage_capture(
+    session_factory: sessionmaker[Session],
+    *,
+    message_id: int,
+    text: str = "Save this article for later: https://example.com/article",
+) -> object:
+    with session_factory() as session:
+        capture = Capture(
+            platform="discord",
+            external_message_id=message_id,
+            conversation_id=456,
+            sender_id=123,
+            source_type="webpage",
+            raw_text=text,
+            source_metadata={
+                "url": "https://example.com/article",
+                "canonical_url": "https://example.com/article",
+                "submitted_text": text,
+            },
+            processing_status=WEB_EXTRACTION_PENDING_STATUS,
+        )
+        session.add(capture)
+        session.commit()
+        return capture.id
+
+
+def test_webpage_extraction_stores_bounded_metadata_and_is_searchable(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture_id = _add_webpage_capture(session_factory, message_id=44)
+    webpage = WebpageMetadata(
+        url="https://example.com/article",
+        domain="example.com",
+        title="A practical machine learning article",
+        author="Ada Example",
+        published_date="2026-09-10",
+        description="A short description.",
+        headings=["Introduction", "Evaluation"],
+        extraction_status="complete",
+    )
+    monkeypatch.setattr("app.workers.webpage.fetch_webpage_metadata", lambda url: webpage)
+    settings = Settings(discord_allowed_user_id=123)
+
+    assert asyncio.run(extract_webpage_capture(capture_id, settings, session_factory)) is True
+    with session_factory() as session:
+        capture = session.get(Capture, capture_id)
+        assert capture is not None
+        assert capture.processing_status == "captured"
+        assert capture.extraction_attempts == 1
+        assert capture.source_metadata["web"]["title"] == webpage.title
+        assert "A practical machine learning article" in capture.raw_text
+        assert "Introduction" in capture.raw_text
+        assert "full HTML" not in capture.raw_text
+
+    provider = FakeProvider()
+    assert asyncio.run(enrich_capture(capture_id, settings, session_factory, provider)) is True
+    query = FakeMessage(45, "Did I save anything about machine learning?")
+    asyncio.run(
+        process_discord_message(
+            query,
+            settings,
+            session_factory,
+            provider=provider,
+        )
+    )
+    response = query.channel.sent_messages[-1]
+    assert "A practical machine learning article" in response
+    assert "https://example.com/article" in response
+    assert "Type: webpage" in response
+
+
+def test_webpage_extraction_failure_is_visible_and_retryable(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture_id = _add_webpage_capture(session_factory, message_id=46)
+    settings = Settings(discord_allowed_user_id=123)
+
+    def fail(_: str) -> WebpageMetadata:
+        raise RuntimeError("page blocked")
+
+    monkeypatch.setattr("app.workers.webpage.fetch_webpage_metadata", fail)
+    assert asyncio.run(extract_webpage_capture(capture_id, settings, session_factory)) is False
+    with session_factory() as session:
+        failed = session.get(Capture, capture_id)
+        assert failed is not None
+        assert failed.processing_status == WEB_EXTRACTION_FAILED_STATUS
+        assert failed.processing_error == "page blocked"
+        assert failed.extraction_attempts == 1
+
+    retry = FakeMessage(47, "/retry")
+    scheduled: list[object] = []
+    asyncio.run(
+        process_discord_message(
+            retry,
+            settings,
+            session_factory,
+            web_extraction_scheduler=scheduled.append,
+        )
+    )
+    assert retry.channel.sent_messages == [
+        "Retrying webpage extraction for: https://example.com/article"
+    ]
+    assert scheduled == [capture_id]
+
+    webpage = WebpageMetadata(
+        url="https://example.com/article",
+        domain="example.com",
+        title="Recovered article",
+        extraction_status="metadata_only",
+    )
+    monkeypatch.setattr("app.workers.webpage.fetch_webpage_metadata", lambda url: webpage)
+    assert asyncio.run(extract_webpage_capture(capture_id, settings, session_factory)) is True
+    with session_factory() as session:
+        recovered = session.get(Capture, capture_id)
+        assert recovered is not None
+        assert recovered.processing_status == "captured"
+        assert recovered.processing_error is None
+        assert recovered.extraction_attempts == 2
 
 
 def test_natural_query_searches_without_saving_the_question(

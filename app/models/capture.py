@@ -56,6 +56,9 @@ class Capture(Base):
         String(32), nullable=False, default="captured", server_default="captured"
     )
     processing_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    extraction_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     transcription_attempts: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default="0"
     )

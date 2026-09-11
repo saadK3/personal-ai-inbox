@@ -31,7 +31,7 @@ Project scaffolding and development-environment setup are enabling work, not a p
 | 3 | Semantic memory | Find something using its meaning rather than exact wording |
 | 4 | Natural save/query routing | Ask naturally without always typing `/ask` |
 | 5 | Voice-note memory | Send a voice note, have it transcribed, and find it later |
-| 6 | Webpage memory | Send an article or URL, extract its contents, and retrieve it |
+| 6 | Webpage memory | Send an article or URL, save bounded metadata, and retrieve it |
 | 7 | YouTube memory | Save a YouTube video with metadata or transcript and find it later |
 | 8 | GitHub repository memory | Save a repository with useful metadata and retrieve it |
 | 9 | Image and screenshot memory | Send an image, understand its contents, and find it later |
@@ -157,15 +157,19 @@ The system should prioritize avoiding lost captures over eliminating every unnec
 
 ### End-to-end scope
 
-- Detect general URLs.
-- Preserve the exact submitted URL immediately.
-- Extract the page title, description, and domain when available.
-- Extract readable page content where reasonably possible.
-- Summarize, embed, and index extracted content.
+- Detect general HTTP(S) URLs in a Discord DM.
+- Preserve the exact submitted URL and accompanying user text immediately.
+- Extract bounded standard metadata: title, author, publication date, description,
+  domain, and up to a small number of main headings.
+- Use Open Graph, standard meta tags, schema metadata, and headings where available;
+  never persist the full HTML body, scripts, styles, or a page copy.
+- Summarize, embed, and index the bounded metadata together with the user's context.
 - Detect repeated URLs and communicate the duplicate without losing provenance.
-- Handle private, blocked, unavailable, and dynamically rendered pages safely.
-- Retrieve the saved result with its original URL.
-- Test complete extraction, metadata-only fallback, duplicate submission, and extraction failure.
+- Fall back to the URL, submitted context, and any metadata available when a page is
+  private, blocked, unavailable, unsupported, or dynamically rendered.
+- Retrieve the saved result with its original URL and selected metadata visible.
+- Test complete extraction, bounded fields, metadata-only fallback, duplicate
+  submission, and extraction failure/retry.
 
 A failed extraction must still produce a saved and retrievable URL item.
 
