@@ -181,15 +181,15 @@ A failed extraction must still produce a saved and retrievable URL item.
 
 ### End-to-end scope
 
-- Recognize YouTube URLs.
-- Preserve the submitted URL immediately.
-- Extract available title and video metadata.
-- Retrieve and index a transcript when available and permitted.
-- Fall back to metadata-based retrieval when no transcript is available.
-- Apply summarization and embeddings to the best available content.
-- Return the original video URL in retrieval results.
-- Handle private, deleted, inaccessible, and transcript-free videos.
-- Test transcript and metadata-only paths.
+- Recognize canonical YouTube URLs, including `youtu.be` links.
+- Preserve the exact submitted URL and accompanying user text immediately.
+- Extract bounded metadata: title, channel, publication date, and a short description excerpt.
+- Derive lightweight searchable context from the metadata and the user's note.
+- Return a concise result with the title, channel, relevant context, and original URL.
+- Fall back to the URL and submitted context when metadata is unavailable.
+- Handle private, deleted, inaccessible, and malformed video links safely.
+- Do not download video bytes or retrieve/store full transcripts, chapters, summaries, or key takeaways.
+- Test metadata, fallback, unavailable, duplicate, malformed, and retry paths.
 
 ## Slice 8 — GitHub repository memory
 

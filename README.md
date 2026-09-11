@@ -6,7 +6,7 @@ The product requirements are in [PRD.md](PRD.md), and the implementation plan is
 
 ## Current status
 
-The repository contains the development scaffold and the first six product slices. It includes:
+The repository contains the development scaffold and the first seven product slices. It includes:
 
 - FastAPI application with liveness and database-readiness endpoints
 - Discord Gateway bot for private DM capture
@@ -18,8 +18,9 @@ The repository contains the development scaffold and the first six product slice
 
 Vertical Slices 1 and 2—private Discord text capture and exact text retrieval—
 are implemented, Slice 3 adds semantic memory and hybrid retrieval, Slice 4 adds
-natural save/query routing, Slice 5 adds voice-note memory, and Slice 6 adds
-webpage memory. Text captures, voice-note transcripts, and webpage metadata are
+natural save/query routing, Slice 5 adds voice-note memory, Slice 6 adds webpage
+memory, and Slice 7 adds YouTube memory. Text captures, voice-note transcripts,
+webpage metadata, and YouTube metadata are
 acknowledged first, then enriched asynchronously with normalized text, a summary,
 type, topics, entities, and an embedding. Webpage captures retain the submitted
 URL and accompanying note, plus bounded metadata (title, author, publication date,
@@ -107,8 +108,11 @@ Use `/recent` to inspect processing states. A failed item can be retried with
 `/retry`; pending captures are also resumed automatically when the bot restarts.
 Use `/ask <query>` for explicit retrieval, ask a clear memory question in plain
 language, or use `/save <text>` to force a message to be stored. Send a webpage
-URL (optionally with a note) to save its bounded metadata and make it searchable;
-the original URL is shown in results. You can also send a short audio attachment;
+or YouTube URL (optionally with a note) to save bounded metadata and make it
+searchable; the original URL is shown in results. YouTube links use only bounded metadata
+(title, channel, publication date, and a short description); V1 does not download
+video bytes or retrieve transcripts, chapters, summaries, or key takeaways. You
+can also send a short audio attachment;
 the bot will acknowledge it immediately, retain the original attachment reference
 and local copy, then transcribe and enrich it in the background. `/recent` shows
 transcription, webpage-extraction, or enrichment failures, and `/retry` retries

@@ -16,6 +16,7 @@ from app.core.config import Settings
 from app.models.capture import Capture, MessageReceipt
 from app.providers.openai import EnrichmentProvider, OpenAIProvider
 from app.services.webpage import canonicalize_url, extract_url
+from app.services.youtube import canonicalize_youtube_url, extract_youtube_url
 from app.workers.enrichment import (
     TRANSCRIPTION_FAILED_STATUS,
     TRANSCRIPTION_PENDING_STATUS,
@@ -31,6 +32,12 @@ from app.workers.webpage import (
     extract_webpage_capture,
     pending_webpage_ids,
 )
+from app.workers.youtube import (
+    YOUTUBE_EXTRACTION_FAILED_STATUS,
+    YOUTUBE_EXTRACTION_PENDING_STATUS,
+    extract_youtube_capture,
+    pending_youtube_ids,
+)
 
 logger = logging.getLogger(__name__)
 PLATFORM = "discord"
@@ -43,6 +50,7 @@ SHORT_QUERY_SEMANTIC_MIN_SIMILARITY = 0.65
 EnrichmentScheduler = Callable[[uuid.UUID], None]
 TranscriptionScheduler = Callable[[uuid.UUID], None]
 WebExtractionScheduler = Callable[[uuid.UUID], None]
+YouTubeExtractionScheduler = Callable[[uuid.UUID], None]
 MessageRoute = Literal["command", "query", "capture"]
 SUPPORTED_AUDIO_EXTENSIONS = {
     ".flac",
@@ -203,6 +211,8 @@ def _format_recent(captures: list[Capture]) -> str:
         text = (
             _webpage_display_name(capture)
             if capture.source_type == "webpage"
+            else _youtube_display_name(capture)
+            if capture.source_type == "youtube"
             else " ".join(capture.raw_text.split())
         )
         if len(text) > 280:
@@ -264,7 +274,7 @@ def _capture_source(capture: Capture) -> str:
         audio = metadata.get("audio")
         if isinstance(audio, dict) and audio.get("url"):
             return str(audio["url"])
-    if capture.source_type == "webpage" and metadata.get("url"):
+    if capture.source_type in {"webpage", "youtube"} and metadata.get("url"):
         return str(metadata["url"])
     channel_id = metadata.get("channel_id")
     message_id = metadata.get("message_id")
@@ -286,6 +296,8 @@ def _format_search_results(captures: list[Capture], query: str) -> str:
         text = (
             _webpage_display_name(capture)
             if capture.source_type == "webpage"
+            else _youtube_display_name(capture)
+            if capture.source_type == "youtube"
             else " ".join(capture.raw_text.split())
         )
         if len(text) > 280:
@@ -312,6 +324,26 @@ def _format_search_results(captures: list[Capture], query: str) -> str:
                     heading_text = "; ".join(str(heading) for heading in headings[:3])
                     lines.append(f"   Headings: {_truncate(heading_text, 240)}")
             lines.append("   Type: webpage")
+        elif capture.source_type == "youtube":
+            youtube = (capture.source_metadata or {}).get("youtube")
+            if isinstance(youtube, dict):
+                details = [
+                    str(value)
+                    for value in (
+                        youtube.get("channel"),
+                        youtube.get("published_date"),
+                    )
+                    if value
+                ]
+                if details:
+                    lines.append(f"   Metadata: {' · '.join(details)}")
+                if youtube.get("description"):
+                    lines.append(
+                        f"   Description: {_truncate(str(youtube['description']), 240)}"
+                    )
+                if youtube.get("error"):
+                    lines.append(f"   Metadata note: {_truncate(str(youtube['error']), 240)}")
+            lines.append("   Type: youtube")
         if capture.summary:
             lines.append(f"   Summary: {_truncate(capture.summary, 240)}")
         lines.append(f"   Source: {_capture_source(capture)}")
@@ -591,6 +623,16 @@ def _webpage_display_name(capture: Capture) -> str:
     return "webpage"
 
 
+def _youtube_display_name(capture: Capture) -> str:
+    metadata = capture.source_metadata or {}
+    youtube = metadata.get("youtube")
+    if isinstance(youtube, dict) and youtube.get("title"):
+        return str(youtube["title"])
+    if metadata.get("url"):
+        return str(metadata["url"])
+    return "YouTube video"
+
+
 def _find_duplicate_webpage(
     session: Session,
     conversation_id: int,
@@ -608,6 +650,31 @@ def _find_duplicate_webpage(
     for capture in captures:
         existing_url = (capture.source_metadata or {}).get("url")
         if isinstance(existing_url, str) and canonicalize_url(existing_url) == canonical_url:
+            return capture
+    return None
+
+
+def _find_duplicate_youtube(
+    session: Session,
+    conversation_id: int,
+    url: str,
+) -> Capture | None:
+    canonical_url = canonicalize_youtube_url(url)
+    captures = session.scalars(
+        select(Capture).where(
+            Capture.platform == PLATFORM,
+            Capture.conversation_id == conversation_id,
+            Capture.source_type == "youtube",
+            Capture.deleted_at.is_(None),
+        )
+    )
+    for capture in captures:
+        metadata = capture.source_metadata or {}
+        existing_url = metadata.get("canonical_url") or metadata.get("url")
+        if (
+            isinstance(existing_url, str)
+            and canonicalize_youtube_url(existing_url) == canonical_url
+        ):
             return capture
     return None
 
@@ -632,6 +699,7 @@ async def process_discord_message(
     enrichment_scheduler: EnrichmentScheduler | None = None,
     transcription_scheduler: TranscriptionScheduler | None = None,
     web_extraction_scheduler: WebExtractionScheduler | None = None,
+    youtube_extraction_scheduler: YouTubeExtractionScheduler | None = None,
 ) -> None:
     """Handle one Discord message while keeping capture persistence synchronous and durable."""
 
@@ -749,7 +817,12 @@ async def process_discord_message(
                         Capture.conversation_id == message.channel.id,
                         Capture.deleted_at.is_(None),
                         Capture.processing_status.in_(
-                            {"failed", TRANSCRIPTION_FAILED_STATUS, WEB_EXTRACTION_FAILED_STATUS}
+                            {
+                                "failed",
+                                TRANSCRIPTION_FAILED_STATUS,
+                                WEB_EXTRACTION_FAILED_STATUS,
+                                YOUTUBE_EXTRACTION_FAILED_STATUS,
+                            }
                         ),
                     )
                     .order_by(Capture.created_at.desc(), Capture.id.desc())
@@ -764,6 +837,11 @@ async def process_discord_message(
                 elif retry_capture.processing_status == WEB_EXTRACTION_FAILED_STATUS:
                     response_text = (
                         f"Retrying webpage extraction for: {_webpage_display_name(retry_capture)}"
+                    )
+                elif retry_capture.processing_status == YOUTUBE_EXTRACTION_FAILED_STATUS:
+                    response_text = (
+                        f"Retrying YouTube metadata extraction for: "
+                        f"{_youtube_display_name(retry_capture)}"
                     )
                 else:
                     response_text = f"Retrying enrichment for: {retry_capture.raw_text}"
@@ -789,8 +867,59 @@ async def process_discord_message(
                 elif retry_capture.processing_status == WEB_EXTRACTION_FAILED_STATUS:
                     if web_extraction_scheduler is not None:
                         web_extraction_scheduler(retry_capture.id)
+                elif retry_capture.processing_status == YOUTUBE_EXTRACTION_FAILED_STATUS:
+                    if youtube_extraction_scheduler is not None:
+                        youtube_extraction_scheduler(retry_capture.id)
                 elif enrichment_scheduler is not None:
                     enrichment_scheduler(retry_capture.id)
+            return
+
+        youtube_url = extract_youtube_url(text)
+        if youtube_url is not None:
+            duplicate = _find_duplicate_youtube(
+                session,
+                conversation_id=message.channel.id,
+                url=youtube_url,
+            )
+            source_metadata = _source_metadata(message)
+            source_metadata["url"] = youtube_url
+            source_metadata["canonical_url"] = canonicalize_youtube_url(youtube_url)
+            source_metadata["submitted_text"] = text
+            if duplicate is not None:
+                source_metadata["duplicate_of"] = str(duplicate.id)
+            youtube_capture = Capture(
+                platform=PLATFORM,
+                external_message_id=message.id,
+                conversation_id=message.channel.id,
+                sender_id=message.author.id,
+                source_type="youtube",
+                raw_text=text,
+                source_metadata=source_metadata,
+                processing_status=YOUTUBE_EXTRACTION_PENDING_STATUS,
+            )
+            session.add(youtube_capture)
+            try:
+                session.commit()
+                session.refresh(youtube_capture)
+            except IntegrityError:
+                session.rollback()
+                return
+
+            extraction_state = (
+                "metadata extraction started in the background"
+                if youtube_extraction_scheduler is not None
+                else "metadata extraction is waiting for the worker"
+            )
+            if duplicate is None:
+                response_text = f"Saved YouTube video; {extraction_state}."
+            else:
+                response_text = (
+                    "Saved YouTube video; this URL was already captured, so I kept this "
+                    f"submission as a new provenance record. {extraction_state}."
+                )
+            await _send_ack(message, response_text)
+            if youtube_extraction_scheduler is not None:
+                youtube_extraction_scheduler(youtube_capture.id)
             return
 
         webpage_url = extract_url(text)
@@ -911,8 +1040,8 @@ async def process_discord_message(
             session.commit()
             await _send_ack(
                 message,
-                "I can save text messages, voice notes, and webpage links right now. "
-                "Support for images is coming next.",
+                "I can save text messages, voice notes, webpages, and YouTube links "
+                "right now. Support for images is coming next.",
             )
             return
 
@@ -959,13 +1088,26 @@ class PersonalInboxDiscordClient(discord.Client):
         self._enrichment_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
         self._transcription_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
         self._web_extraction_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
+        self._youtube_extraction_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
 
-    def schedule_enrichment(self, capture_id: uuid.UUID) -> None:
+    def schedule_enrichment(
+        self,
+        capture_id: uuid.UUID,
+        *,
+        store_summary: bool | None = None,
+    ) -> None:
         """Queue enrichment in-process while retaining durable DB state."""
 
         if self.provider is None:
             logger.warning("Skipping enrichment because OPENAI_API_KEY is not configured")
             return
+        if store_summary is None:
+            session = self.session_factory()
+            try:
+                capture = session.get(Capture, capture_id)
+                store_summary = capture is None or capture.source_type != "youtube"
+            finally:
+                session.close()
         current_task = self._enrichment_tasks.get(capture_id)
         if current_task is not None and not current_task.done():
             return
@@ -975,6 +1117,7 @@ class PersonalInboxDiscordClient(discord.Client):
                 settings=self.settings,
                 session_factory=self.session_factory,
                 provider=self.provider,
+                store_summary=store_summary,
             )
         )
         self._enrichment_tasks[capture_id] = task
@@ -1058,6 +1201,37 @@ class PersonalInboxDiscordClient(discord.Client):
         if succeeded:
             self.schedule_enrichment(capture_id)
 
+    def schedule_youtube_extraction(self, capture_id: uuid.UUID) -> None:
+        """Queue bounded YouTube metadata extraction."""
+
+        current_task = self._youtube_extraction_tasks.get(capture_id)
+        if current_task is not None and not current_task.done():
+            return
+        task = asyncio.create_task(self._extract_youtube_and_enrich(capture_id))
+        self._youtube_extraction_tasks[capture_id] = task
+
+        def _forget(done_task: asyncio.Task[None]) -> None:
+            if self._youtube_extraction_tasks.get(capture_id) is done_task:
+                self._youtube_extraction_tasks.pop(capture_id, None)
+            if not done_task.cancelled():
+                exception = done_task.exception()
+                if exception is not None:
+                    logger.error(
+                        "YouTube extraction task crashed",
+                        exc_info=(type(exception), exception, exception.__traceback__),
+                    )
+
+        task.add_done_callback(_forget)
+
+    async def _extract_youtube_and_enrich(self, capture_id: uuid.UUID) -> None:
+        succeeded = await extract_youtube_capture(
+            capture_id,
+            settings=self.settings,
+            session_factory=self.session_factory,
+        )
+        if succeeded:
+            self.schedule_enrichment(capture_id, store_summary=False)
+
     def recover_pending_enrichment(self) -> None:
         """Resume captures left pending by a restart, up to the retry budget."""
 
@@ -1104,9 +1278,24 @@ class PersonalInboxDiscordClient(discord.Client):
         for capture_id in capture_ids:
             self.schedule_web_extraction(capture_id)
 
+    def recover_pending_youtube_extraction(self) -> None:
+        """Resume YouTube captures left before metadata extraction completed."""
+
+        session = self.session_factory()
+        try:
+            capture_ids = pending_youtube_ids(
+                session,
+                max_attempts=self.settings.enrichment_max_attempts,
+            )
+        finally:
+            session.close()
+        for capture_id in capture_ids:
+            self.schedule_youtube_extraction(capture_id)
+
     async def on_ready(self) -> None:
         logger.info("Discord bot connected as %s", self.user)
         self.recover_pending_web_extraction()
+        self.recover_pending_youtube_extraction()
         self.recover_pending_transcription()
         self.recover_pending_enrichment()
 
@@ -1119,4 +1308,5 @@ class PersonalInboxDiscordClient(discord.Client):
             enrichment_scheduler=self.schedule_enrichment,
             transcription_scheduler=self.schedule_transcription,
             web_extraction_scheduler=self.schedule_web_extraction,
+            youtube_extraction_scheduler=self.schedule_youtube_extraction,
         )

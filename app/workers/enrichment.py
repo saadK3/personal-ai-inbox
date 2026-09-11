@@ -217,6 +217,8 @@ async def enrich_capture(
     settings: Settings,
     session_factory: sessionmaker[Session],
     provider: EnrichmentProvider | None = None,
+    *,
+    store_summary: bool = True,
 ) -> bool:
     """Enrich one capture and persist success or failure without losing raw text."""
 
@@ -262,7 +264,7 @@ async def enrich_capture(
         if processed_capture is None or processed_capture.deleted_at is not None:
             return False
         processed_capture.normalized_text = result.normalized_text
-        processed_capture.summary = result.summary
+        processed_capture.summary = result.summary if store_summary else None
         processed_capture.inferred_type = result.inferred_type
         processed_capture.topics = result.topics
         processed_capture.entities = result.entities

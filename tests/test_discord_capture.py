@@ -14,6 +14,12 @@ from app.core.config import Settings
 from app.models import Capture, MessageReceipt
 from app.providers.openai import EnrichmentResult, OpenAIProvider
 from app.services.webpage import WebpageMetadata
+from app.services.youtube import (
+    YouTubeMetadata,
+    canonicalize_youtube_url,
+    extract_youtube_url,
+    parse_youtube_url,
+)
 from app.workers.enrichment import (
     TRANSCRIPTION_FAILED_STATUS,
     TRANSCRIPTION_PENDING_STATUS,
@@ -25,6 +31,11 @@ from app.workers.webpage import (
     WEB_EXTRACTION_FAILED_STATUS,
     WEB_EXTRACTION_PENDING_STATUS,
     extract_webpage_capture,
+)
+from app.workers.youtube import (
+    YOUTUBE_EXTRACTION_FAILED_STATUS,
+    YOUTUBE_EXTRACTION_PENDING_STATUS,
+    extract_youtube_capture,
 )
 
 
@@ -538,6 +549,227 @@ def test_webpage_extraction_failure_is_visible_and_retryable(
         assert recovered.processing_status == "captured"
         assert recovered.processing_error is None
         assert recovered.extraction_attempts == 2
+
+
+def test_youtube_url_forms_are_recognized_and_share_video_identity() -> None:
+    watch = "https://www.youtube.com/watch?v=abc123XYZ89"
+    short = "https://youtu.be/abc123XYZ89?t=42"
+    assert extract_youtube_url(f"Watch this: {watch}.") == watch
+    assert parse_youtube_url(short) is not None
+    assert parse_youtube_url(short).video_id == "abc123XYZ89"
+    assert canonicalize_youtube_url(short) == canonicalize_youtube_url(watch)
+    malformed = "https://www.youtube.com/watch"
+    assert extract_youtube_url(malformed) == malformed
+    assert parse_youtube_url(malformed).video_id is None
+
+
+def test_youtube_url_is_persisted_before_extraction_and_duplicate_provenance(
+    session_factory: sessionmaker[Session],
+) -> None:
+    first = FakeMessage(
+        80,
+        "Watch this machine learning lecture: https://www.youtube.com/watch?v=abc123XYZ89",
+    )
+    second = FakeMessage(
+        81,
+        "Same video again: https://youtu.be/abc123XYZ89?t=42",
+    )
+    scheduled: list[object] = []
+
+    for message in (first, second):
+        asyncio.run(
+            process_discord_message(
+                message,
+                Settings(discord_allowed_user_id=123),
+                session_factory,
+                youtube_extraction_scheduler=scheduled.append,
+            )
+        )
+
+    assert first.channel.sent_messages == [
+        "Saved YouTube video; metadata extraction started in the background."
+    ]
+    assert second.channel.sent_messages == [
+        "Saved YouTube video; this URL was already captured, so I kept this submission as a "
+        "new provenance record. metadata extraction started in the background."
+    ]
+    with session_factory() as session:
+        captures = list(session.scalars(select(Capture).where(Capture.source_type == "youtube")))
+        assert len(captures) == 2
+        assert captures[0].source_metadata["url"].startswith("https://www.youtube.com/watch")
+        assert captures[1].source_metadata["duplicate_of"] == str(captures[0].id)
+        assert captures[0].source_metadata["canonical_url"] == captures[1].source_metadata[
+            "canonical_url"
+        ]
+        assert scheduled == [captures[0].id, captures[1].id]
+
+
+def _add_youtube_capture(
+    session_factory: sessionmaker[Session],
+    *,
+    message_id: int,
+    text: str = "Save this machine learning video: https://www.youtube.com/watch?v=abc123XYZ89",
+) -> object:
+    with session_factory() as session:
+        capture = Capture(
+            platform="discord",
+            external_message_id=message_id,
+            conversation_id=456,
+            sender_id=123,
+            source_type="youtube",
+            raw_text=text,
+            source_metadata={
+                "url": "https://www.youtube.com/watch?v=abc123XYZ89",
+                "canonical_url": "https://www.youtube.com/watch?v=abc123XYZ89",
+                "submitted_text": text,
+            },
+            processing_status=YOUTUBE_EXTRACTION_PENDING_STATUS,
+        )
+        session.add(capture)
+        session.commit()
+        return capture.id
+
+
+def test_youtube_metadata_is_bounded_searchable_and_returns_original_url(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture_id = _add_youtube_capture(session_factory, message_id=82)
+    youtube = YouTubeMetadata(
+        url="https://www.youtube.com/watch?v=abc123XYZ89",
+        canonical_url="https://www.youtube.com/watch?v=abc123XYZ89",
+        video_id="abc123XYZ89",
+        title="A practical deep learning lecture",
+        channel="Ada's ML Channel",
+        published_date="2026-09-10",
+        description="A short description for finding this video later.",
+        extraction_status="complete",
+    )
+    monkeypatch.setattr("app.workers.youtube.fetch_youtube_metadata", lambda url: youtube)
+    settings = Settings(discord_allowed_user_id=123)
+
+    assert asyncio.run(extract_youtube_capture(capture_id, settings, session_factory)) is True
+    with session_factory() as session:
+        capture = session.get(Capture, capture_id)
+        assert capture is not None
+        assert capture.processing_status == "captured"
+        assert capture.extraction_attempts == 1
+        assert capture.source_metadata["youtube"]["channel"] == youtube.channel
+        assert youtube.title in capture.raw_text
+        assert youtube.description in capture.raw_text
+        assert "transcript" not in capture.raw_text.casefold()
+
+    provider = FakeProvider()
+    assert (
+        asyncio.run(
+            enrich_capture(
+                capture_id,
+                settings,
+                session_factory,
+                provider,
+                store_summary=False,
+            )
+        )
+        is True
+    )
+    with session_factory() as session:
+        capture = session.get(Capture, capture_id)
+        assert capture is not None
+        assert capture.summary is None
+    query = FakeMessage(83, "Did I save anything about deep learning?")
+    asyncio.run(
+        process_discord_message(
+            query,
+            settings,
+            session_factory,
+            provider=provider,
+        )
+    )
+    response = query.channel.sent_messages[-1]
+    assert youtube.title in response
+    assert youtube.channel in response
+    assert youtube.url in response
+    assert "Type: youtube" in response
+
+
+def test_youtube_failure_is_visible_retryable_and_metadata_only_fallback_is_kept(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture_id = _add_youtube_capture(session_factory, message_id=84)
+    settings = Settings(discord_allowed_user_id=123)
+
+    def fail(_: str) -> YouTubeMetadata:
+        raise RuntimeError("video unavailable")
+
+    monkeypatch.setattr("app.workers.youtube.fetch_youtube_metadata", fail)
+    assert asyncio.run(extract_youtube_capture(capture_id, settings, session_factory)) is False
+    with session_factory() as session:
+        failed = session.get(Capture, capture_id)
+        assert failed is not None
+        assert failed.processing_status == YOUTUBE_EXTRACTION_FAILED_STATUS
+        assert failed.processing_error == "video unavailable"
+        assert failed.extraction_attempts == 1
+        assert "machine learning" in failed.raw_text
+
+    retry = FakeMessage(85, "/retry")
+    scheduled: list[object] = []
+    asyncio.run(
+        process_discord_message(
+            retry,
+            settings,
+            session_factory,
+            youtube_extraction_scheduler=scheduled.append,
+        )
+    )
+    assert retry.channel.sent_messages == [
+        "Retrying YouTube metadata extraction for: "
+        "https://www.youtube.com/watch?v=abc123XYZ89"
+    ]
+    assert scheduled == [capture_id]
+
+    fallback = YouTubeMetadata(
+        url="https://www.youtube.com/watch?v=abc123XYZ89",
+        canonical_url="https://www.youtube.com/watch?v=abc123XYZ89",
+        video_id="abc123XYZ89",
+        extraction_status="metadata_only",
+        error="metadata unavailable",
+    )
+    monkeypatch.setattr("app.workers.youtube.fetch_youtube_metadata", lambda url: fallback)
+    assert asyncio.run(extract_youtube_capture(capture_id, settings, session_factory)) is True
+    with session_factory() as session:
+        retried = session.get(Capture, capture_id)
+        assert retried is not None
+        assert retried.processing_status == "captured"
+        assert retried.processing_error is None
+        assert retried.extraction_attempts == 2
+        assert "machine learning" in retried.raw_text
+
+
+def test_malformed_youtube_link_is_saved_with_clear_failure(
+    session_factory: sessionmaker[Session],
+) -> None:
+    message = FakeMessage(86, "Broken video: https://www.youtube.com/watch")
+    scheduled: list[object] = []
+    settings = Settings(discord_allowed_user_id=123)
+    asyncio.run(
+        process_discord_message(
+            message,
+            settings,
+            session_factory,
+            youtube_extraction_scheduler=scheduled.append,
+        )
+    )
+    assert message.channel.sent_messages == [
+        "Saved YouTube video; metadata extraction started in the background."
+    ]
+    assert len(scheduled) == 1
+    assert asyncio.run(extract_youtube_capture(scheduled[0], settings, session_factory)) is False
+    with session_factory() as session:
+        capture = session.get(Capture, scheduled[0])
+        assert capture is not None
+        assert capture.processing_status == YOUTUBE_EXTRACTION_FAILED_STATUS
+        assert capture.processing_error == "Malformed YouTube URL"
 
 
 def test_natural_query_searches_without_saving_the_question(
