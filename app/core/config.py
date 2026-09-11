@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     discord_allowed_user_id: int | None = None
     openai_api_key: SecretStr | None = None
     openai_model: str = "gpt-5.6-luna"
+    openai_vision_model: str = "gpt-5.6-luna"
     openai_embedding_model: str = "text-embedding-3-small"
     openai_embedding_dimensions: int = 1536
     openai_transcription_model: str = "gpt-4o-mini-transcribe"

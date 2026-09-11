@@ -7,8 +7,10 @@ run them in a worker thread so Discord's event loop remains responsive.
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
+from mimetypes import guess_type
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -32,6 +34,15 @@ class EnrichmentResult:
     entities: dict[str, list[str]]
 
 
+@dataclass(frozen=True)
+class VisionResult:
+    """Factual, retrieval-oriented output from one image."""
+
+    description: str
+    ocr_text: str | None = None
+    uncertainty: str | None = None
+
+
 class EnrichmentProvider(Protocol):
     """Interface used by the worker and Discord adapter."""
 
@@ -43,6 +54,18 @@ class EnrichmentProvider(Protocol):
 
     def transcribe(self, audio_path: Path) -> str:
         """Transcribe a durable audio file."""
+
+
+class VisionProvider(Protocol):
+    """Interface for factual image description and OCR."""
+
+    def describe_image(
+        self,
+        image_path: Path,
+        mime_type: str,
+        user_context: str,
+    ) -> VisionResult:
+        """Describe visible content and transcribe legible text without guessing."""
 
 
 ENRICHMENT_INSTRUCTIONS = """You enrich one private personal inbox capture for later search.
@@ -86,6 +109,26 @@ ENRICHMENT_SCHEMA: dict[str, Any] = {
     ],
 }
 
+VISION_INSTRUCTIONS = """Analyze one personal image for later retrieval. Return only JSON matching
+the supplied schema. description must be one concise, factual sentence about
+what is visibly present. ocr_text should contain only legible visible text,
+or an empty string when there is none. uncertainty should briefly explain any
+material ambiguity, blur, occlusion, or low quality, or be an empty string.
+Do not identify people, infer private or sensitive attributes, guess intent,
+or describe anything that is not visibly supported by the image.
+"""
+
+VISION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "properties": {
+        "description": {"type": "string"},
+        "ocr_text": {"type": "string"},
+        "uncertainty": {"type": "string"},
+    },
+    "required": ["description", "ocr_text", "uncertainty"],
+}
+
 
 def _string(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
@@ -103,6 +146,17 @@ def _string_list(value: Any, field: str, limit: int = 12) -> list[str]:
             if normalized not in result:
                 result.append(normalized)
     return result
+
+
+def _optional_string(value: Any, field: str, limit: int = 2_000) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ProviderError(f"Vision field {field!r} must be a string")
+    normalized = " ".join(value.split())
+    if not normalized:
+        return None
+    return normalized[:limit]
 
 
 def _parse_enrichment(payload: Any) -> EnrichmentResult:
@@ -195,3 +249,60 @@ class OpenAIProvider:
         if not isinstance(text, str) or not text.strip():
             raise ProviderError("OpenAI returned an empty transcription")
         return " ".join(text.split())
+
+    def describe_image(
+        self,
+        image_path: Path,
+        mime_type: str,
+        user_context: str,
+    ) -> VisionResult:
+        """Describe a local image using a bounded Responses API vision request."""
+
+        if not image_path.is_file() or image_path.stat().st_size == 0:
+            raise ProviderError("Cannot analyze a missing or empty image file")
+        normalized_mime = mime_type.split(";", 1)[0].casefold()
+        if not normalized_mime.startswith("image/"):
+            normalized_mime = guess_type(image_path.name)[0] or "image/jpeg"
+        image_data = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        context = "User context: " + (" ".join(user_context.split()) or "(none)")
+        response = self.client.responses.create(
+            model=self.settings.openai_vision_model,
+            instructions=VISION_INSTRUCTIONS,
+            input=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": context},
+                        {
+                            "type": "input_image",
+                            "image_url": f"data:{normalized_mime};base64,{image_data}",
+                            "detail": "low",
+                        },
+                    ],
+                }
+            ],
+            max_output_tokens=300,
+            text={
+                "format": {
+                    "type": "json_schema",
+                    "name": "image_description",
+                    "strict": True,
+                    "schema": VISION_SCHEMA,
+                }
+            },
+        )
+        output_text = getattr(response, "output_text", None)
+        if not isinstance(output_text, str) or not output_text.strip():
+            raise ProviderError("OpenAI returned no image analysis output")
+        try:
+            payload = json.loads(output_text)
+        except json.JSONDecodeError as exc:
+            raise ProviderError("OpenAI returned invalid image analysis JSON") from exc
+        if not isinstance(payload, dict):
+            raise ProviderError("OpenAI image analysis response must be an object")
+        description = _string(payload.get("description"), "description")
+        return VisionResult(
+            description=description,
+            ocr_text=_optional_string(payload.get("ocr_text"), "ocr_text"),
+            uncertainty=_optional_string(payload.get("uncertainty"), "uncertainty"),
+        )

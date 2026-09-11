@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import Settings
 from app.models.capture import Capture, MessageReceipt
 from app.providers.openai import EnrichmentProvider, OpenAIProvider
+from app.services.github import canonicalize_github_url, extract_github_url
 from app.services.webpage import canonicalize_url, extract_url
 from app.services.youtube import canonicalize_youtube_url, extract_youtube_url
 from app.workers.enrichment import (
@@ -25,6 +26,19 @@ from app.workers.enrichment import (
     pending_capture_ids,
     pending_transcription_ids,
     transcribe_capture,
+)
+from app.workers.github import (
+    GITHUB_EXTRACTION_FAILED_STATUS,
+    GITHUB_EXTRACTION_PENDING_STATUS,
+    extract_github_capture,
+    pending_github_ids,
+)
+from app.workers.image import (
+    IMAGE_FAILED_STATUS,
+    IMAGE_PENDING_STATUS,
+    IMAGE_UNSUPPORTED_STATUS,
+    pending_image_ids,
+    process_image_capture,
 )
 from app.workers.webpage import (
     WEB_EXTRACTION_FAILED_STATUS,
@@ -51,6 +65,8 @@ EnrichmentScheduler = Callable[[uuid.UUID], None]
 TranscriptionScheduler = Callable[[uuid.UUID], None]
 WebExtractionScheduler = Callable[[uuid.UUID], None]
 YouTubeExtractionScheduler = Callable[[uuid.UUID], None]
+GitHubExtractionScheduler = Callable[[uuid.UUID], None]
+ImageProcessingScheduler = Callable[[uuid.UUID], None]
 MessageRoute = Literal["command", "query", "capture"]
 SUPPORTED_AUDIO_EXTENSIONS = {
     ".flac",
@@ -75,6 +91,21 @@ SUPPORTED_AUDIO_CONTENT_TYPES = {
     "audio/webm",
 }
 MAX_DISCORD_ATTACHMENT_BYTES = 25 * 1024 * 1024
+SUPPORTED_IMAGE_EXTENSIONS = {
+    ".bmp",
+    ".gif",
+    ".jpeg",
+    ".jpg",
+    ".png",
+    ".webp",
+}
+IMAGE_CANDIDATE_EXTENSIONS = SUPPORTED_IMAGE_EXTENSIONS | {
+    ".avif",
+    ".heic",
+    ".heif",
+    ".tif",
+    ".tiff",
+}
 SEARCH_STOPWORDS = {
     "a",
     "an",
@@ -213,6 +244,10 @@ def _format_recent(captures: list[Capture]) -> str:
             if capture.source_type == "webpage"
             else _youtube_display_name(capture)
             if capture.source_type == "youtube"
+            else _github_display_name(capture)
+            if capture.source_type == "github"
+            else _image_display_name(capture)
+            if capture.source_type == "image"
             else " ".join(capture.raw_text.split())
         )
         if len(text) > 280:
@@ -274,7 +309,11 @@ def _capture_source(capture: Capture) -> str:
         audio = metadata.get("audio")
         if isinstance(audio, dict) and audio.get("url"):
             return str(audio["url"])
-    if capture.source_type in {"webpage", "youtube"} and metadata.get("url"):
+    if capture.source_type == "image":
+        image = metadata.get("image")
+        if isinstance(image, dict) and image.get("url"):
+            return str(image["url"])
+    if capture.source_type in {"webpage", "youtube", "github"} and metadata.get("url"):
         return str(metadata["url"])
     channel_id = metadata.get("channel_id")
     message_id = metadata.get("message_id")
@@ -298,6 +337,10 @@ def _format_search_results(captures: list[Capture], query: str) -> str:
             if capture.source_type == "webpage"
             else _youtube_display_name(capture)
             if capture.source_type == "youtube"
+            else _github_display_name(capture)
+            if capture.source_type == "github"
+            else _image_display_name(capture)
+            if capture.source_type == "image"
             else " ".join(capture.raw_text.split())
         )
         if len(text) > 280:
@@ -344,7 +387,44 @@ def _format_search_results(captures: list[Capture], query: str) -> str:
                 if youtube.get("error"):
                     lines.append(f"   Metadata note: {_truncate(str(youtube['error']), 240)}")
             lines.append("   Type: youtube")
-        if capture.summary:
+        elif capture.source_type == "github":
+            github = (capture.source_metadata or {}).get("github")
+            if isinstance(github, dict):
+                identity = "/".join(
+                    str(value)
+                    for value in (github.get("owner"), github.get("repository"))
+                    if value
+                )
+                if identity:
+                    lines.append(f"   Repository: {_truncate(identity, 240)}")
+                if github.get("description"):
+                    lines.append(
+                        f"   Description: {_truncate(str(github['description']), 300)}"
+                    )
+                topics = github.get("topics")
+                if isinstance(topics, list) and topics:
+                    topic_text = ", ".join(str(topic) for topic in topics[:10])
+                    lines.append(
+                        f"   Topics: {_truncate(topic_text, 240)}"
+                    )
+                if github.get("error"):
+                    lines.append(f"   Metadata note: {_truncate(str(github['error']), 240)}")
+            lines.append("   Type: github")
+        elif capture.source_type == "image":
+            image = (capture.source_metadata or {}).get("image")
+            if isinstance(image, dict):
+                if image.get("description"):
+                    lines.append(
+                        f"   Description: {_truncate(str(image['description']), 300)}"
+                    )
+                if image.get("ocr_text"):
+                    lines.append(f"   Visible text: {_truncate(str(image['ocr_text']), 300)}")
+                if image.get("uncertainty"):
+                    lines.append(
+                        f"   Uncertainty: {_truncate(str(image['uncertainty']), 240)}"
+                    )
+            lines.append("   Type: image")
+        if capture.summary and capture.source_type not in {"youtube", "github", "image"}:
             lines.append(f"   Summary: {_truncate(capture.summary, 240)}")
         lines.append(f"   Source: {_capture_source(capture)}")
     return _truncate("\n".join(lines))
@@ -591,6 +671,17 @@ def _voice_attachment(message: Any) -> Any | None:
     return None
 
 
+def _image_attachment(message: Any) -> Any | None:
+    attachments = list(getattr(message, "attachments", []) or [])
+    for attachment in attachments:
+        content_type = (getattr(attachment, "content_type", None) or "").split(";", 1)[0]
+        filename = str(getattr(attachment, "filename", ""))
+        extension = Path(filename).suffix.casefold()
+        if content_type.casefold().startswith("image/") or extension in IMAGE_CANDIDATE_EXTENSIONS:
+            return attachment
+    return None
+
+
 def _voice_metadata(message: Any, attachment: Any) -> dict[str, Any]:
     metadata = _source_metadata(message)
     filename = str(getattr(attachment, "filename", "voice-note.ogg"))
@@ -606,11 +697,31 @@ def _voice_metadata(message: Any, attachment: Any) -> dict[str, Any]:
     return metadata
 
 
+def _image_metadata(message: Any, attachment: Any) -> dict[str, Any]:
+    metadata = _source_metadata(message)
+    metadata["image"] = {
+        "id": str(getattr(attachment, "id", "")),
+        "filename": str(getattr(attachment, "filename", "image.jpg")),
+        "content_type": getattr(attachment, "content_type", None),
+        "size": getattr(attachment, "size", None),
+        "url": getattr(attachment, "url", None),
+    }
+    return metadata
+
+
 def _voice_display_name(capture: Capture) -> str:
     audio = (capture.source_metadata or {}).get("audio")
     if isinstance(audio, dict) and audio.get("filename"):
         return str(audio["filename"])
     return "voice note"
+
+
+def _image_display_name(capture: Capture) -> str:
+    metadata = capture.source_metadata or {}
+    image = metadata.get("image")
+    if isinstance(image, dict) and image.get("filename"):
+        return str(image["filename"])
+    return "image"
 
 
 def _webpage_display_name(capture: Capture) -> str:
@@ -631,6 +742,19 @@ def _youtube_display_name(capture: Capture) -> str:
     if metadata.get("url"):
         return str(metadata["url"])
     return "YouTube video"
+
+
+def _github_display_name(capture: Capture) -> str:
+    metadata = capture.source_metadata or {}
+    github = metadata.get("github")
+    if isinstance(github, dict):
+        owner = github.get("owner")
+        repository = github.get("repository")
+        if owner and repository:
+            return f"{owner}/{repository}"
+    if metadata.get("url"):
+        return str(metadata["url"])
+    return "GitHub repository"
 
 
 def _find_duplicate_webpage(
@@ -679,6 +803,31 @@ def _find_duplicate_youtube(
     return None
 
 
+def _find_duplicate_github(
+    session: Session,
+    conversation_id: int,
+    url: str,
+) -> Capture | None:
+    canonical_url = canonicalize_github_url(url)
+    captures = session.scalars(
+        select(Capture).where(
+            Capture.platform == PLATFORM,
+            Capture.conversation_id == conversation_id,
+            Capture.source_type == "github",
+            Capture.deleted_at.is_(None),
+        )
+    )
+    for capture in captures:
+        metadata = capture.source_metadata or {}
+        existing_url = metadata.get("canonical_url") or metadata.get("url")
+        if (
+            isinstance(existing_url, str)
+            and canonicalize_github_url(existing_url) == canonical_url
+        ):
+            return capture
+    return None
+
+
 async def _send_ack(message: Any, text: str) -> bool:
     try:
         await message.channel.send(_truncate(text))
@@ -700,6 +849,8 @@ async def process_discord_message(
     transcription_scheduler: TranscriptionScheduler | None = None,
     web_extraction_scheduler: WebExtractionScheduler | None = None,
     youtube_extraction_scheduler: YouTubeExtractionScheduler | None = None,
+    github_extraction_scheduler: GitHubExtractionScheduler | None = None,
+    image_processing_scheduler: ImageProcessingScheduler | None = None,
 ) -> None:
     """Handle one Discord message while keeping capture persistence synchronous and durable."""
 
@@ -822,6 +973,8 @@ async def process_discord_message(
                                 TRANSCRIPTION_FAILED_STATUS,
                                 WEB_EXTRACTION_FAILED_STATUS,
                                 YOUTUBE_EXTRACTION_FAILED_STATUS,
+                                GITHUB_EXTRACTION_FAILED_STATUS,
+                                IMAGE_FAILED_STATUS,
                             }
                         ),
                     )
@@ -842,6 +995,16 @@ async def process_discord_message(
                     response_text = (
                         f"Retrying YouTube metadata extraction for: "
                         f"{_youtube_display_name(retry_capture)}"
+                    )
+                elif retry_capture.processing_status == GITHUB_EXTRACTION_FAILED_STATUS:
+                    response_text = (
+                        "Retrying GitHub metadata extraction for: "
+                        f"{_github_display_name(retry_capture)}"
+                    )
+                elif retry_capture.processing_status == IMAGE_FAILED_STATUS:
+                    response_text = (
+                        "Retrying image processing for: "
+                        f"{_image_display_name(retry_capture)}"
                     )
                 else:
                     response_text = f"Retrying enrichment for: {retry_capture.raw_text}"
@@ -870,6 +1033,12 @@ async def process_discord_message(
                 elif retry_capture.processing_status == YOUTUBE_EXTRACTION_FAILED_STATUS:
                     if youtube_extraction_scheduler is not None:
                         youtube_extraction_scheduler(retry_capture.id)
+                elif retry_capture.processing_status == GITHUB_EXTRACTION_FAILED_STATUS:
+                    if github_extraction_scheduler is not None:
+                        github_extraction_scheduler(retry_capture.id)
+                elif retry_capture.processing_status == IMAGE_FAILED_STATUS:
+                    if image_processing_scheduler is not None:
+                        image_processing_scheduler(retry_capture.id)
                 elif enrichment_scheduler is not None:
                     enrichment_scheduler(retry_capture.id)
             return
@@ -920,6 +1089,54 @@ async def process_discord_message(
             await _send_ack(message, response_text)
             if youtube_extraction_scheduler is not None:
                 youtube_extraction_scheduler(youtube_capture.id)
+            return
+
+        github_url = extract_github_url(text)
+        if github_url is not None:
+            duplicate = _find_duplicate_github(
+                session,
+                conversation_id=message.channel.id,
+                url=github_url,
+            )
+            source_metadata = _source_metadata(message)
+            source_metadata["url"] = github_url
+            source_metadata["canonical_url"] = canonicalize_github_url(github_url)
+            source_metadata["submitted_text"] = text
+            if duplicate is not None:
+                source_metadata["duplicate_of"] = str(duplicate.id)
+            github_capture = Capture(
+                platform=PLATFORM,
+                external_message_id=message.id,
+                conversation_id=message.channel.id,
+                sender_id=message.author.id,
+                source_type="github",
+                raw_text=text,
+                source_metadata=source_metadata,
+                processing_status=GITHUB_EXTRACTION_PENDING_STATUS,
+            )
+            session.add(github_capture)
+            try:
+                session.commit()
+                session.refresh(github_capture)
+            except IntegrityError:
+                session.rollback()
+                return
+
+            extraction_state = (
+                "metadata extraction started in the background"
+                if github_extraction_scheduler is not None
+                else "metadata extraction is waiting for the worker"
+            )
+            if duplicate is None:
+                response_text = f"Saved GitHub repository; {extraction_state}."
+            else:
+                response_text = (
+                    "Saved GitHub repository; this URL was already captured, so I kept "
+                    f"this submission as a new provenance record. {extraction_state}."
+                )
+            await _send_ack(message, response_text)
+            if github_extraction_scheduler is not None:
+                github_extraction_scheduler(github_capture.id)
             return
 
         webpage_url = extract_url(text)
@@ -981,6 +1198,65 @@ async def process_discord_message(
             await _send_ack(message, _format_natural_query_results(matches, text))
             return
 
+        image_attachment = _image_attachment(message)
+        if image_attachment is not None:
+            filename = str(getattr(image_attachment, "filename", "image.jpg"))
+            extension = Path(filename).suffix.casefold()
+            content_type = (
+                (getattr(image_attachment, "content_type", None) or "")
+                .split(";", 1)[0]
+                .casefold()
+            )
+            size = getattr(image_attachment, "size", None)
+            supported_format = extension in SUPPORTED_IMAGE_EXTENSIONS or content_type in {
+                "image/gif",
+                "image/jpeg",
+                "image/png",
+                "image/webp",
+            }
+            unsupported_reason: str | None = None
+            if not supported_format:
+                unsupported_reason = f"unsupported image format ({filename})"
+            elif isinstance(size, int) and size > MAX_DISCORD_ATTACHMENT_BYTES:
+                unsupported_reason = "image attachments must be 25 MB or smaller"
+
+            image_capture = Capture(
+                platform=PLATFORM,
+                external_message_id=message.id,
+                conversation_id=message.channel.id,
+                sender_id=message.author.id,
+                source_type="image",
+                raw_text=text.strip() or f"[Image: {filename}]",
+                source_metadata={
+                    **_image_metadata(message, image_attachment),
+                    "submitted_text": text,
+                },
+                processing_status=(
+                    IMAGE_UNSUPPORTED_STATUS
+                    if unsupported_reason is not None
+                    else IMAGE_PENDING_STATUS
+                ),
+                processing_error=unsupported_reason,
+            )
+            session.add(image_capture)
+            try:
+                session.commit()
+                session.refresh(image_capture)
+            except IntegrityError:
+                session.rollback()
+                return
+
+            if unsupported_reason is not None:
+                response_text = f"Image saved, but I can’t process it: {unsupported_reason}."
+            elif image_processing_scheduler is None:
+                response_text = "Image saved; vision processing is waiting for the worker."
+            else:
+                response_text = "Image saved; vision processing started in the background."
+            await _send_ack(message, response_text)
+            if unsupported_reason is None and image_processing_scheduler is not None:
+                image_processing_scheduler(image_capture.id)
+            return
+
         voice_attachment = _voice_attachment(message)
         if voice_attachment is not None:
             filename = str(getattr(voice_attachment, "filename", "voice-note.ogg"))
@@ -1040,8 +1316,8 @@ async def process_discord_message(
             session.commit()
             await _send_ack(
                 message,
-                "I can save text messages, voice notes, webpages, and YouTube links "
-                "right now. Support for images is coming next.",
+                "I can save text messages, voice notes, images, webpages, YouTube links, "
+                "and GitHub repositories right now.",
             )
             return
 
@@ -1089,6 +1365,8 @@ class PersonalInboxDiscordClient(discord.Client):
         self._transcription_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
         self._web_extraction_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
         self._youtube_extraction_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
+        self._github_extraction_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
+        self._image_processing_tasks: dict[uuid.UUID, asyncio.Task[None]] = {}
 
     def schedule_enrichment(
         self,
@@ -1105,7 +1383,11 @@ class PersonalInboxDiscordClient(discord.Client):
             session = self.session_factory()
             try:
                 capture = session.get(Capture, capture_id)
-                store_summary = capture is None or capture.source_type != "youtube"
+                store_summary = capture is None or capture.source_type not in {
+                    "youtube",
+                    "github",
+                    "image",
+                }
             finally:
                 session.close()
         current_task = self._enrichment_tasks.get(capture_id)
@@ -1232,6 +1514,69 @@ class PersonalInboxDiscordClient(discord.Client):
         if succeeded:
             self.schedule_enrichment(capture_id, store_summary=False)
 
+    def schedule_github_extraction(self, capture_id: uuid.UUID) -> None:
+        """Queue bounded GitHub repository metadata extraction."""
+
+        current_task = self._github_extraction_tasks.get(capture_id)
+        if current_task is not None and not current_task.done():
+            return
+        task = asyncio.create_task(self._extract_github_and_enrich(capture_id))
+        self._github_extraction_tasks[capture_id] = task
+
+        def _forget(done_task: asyncio.Task[None]) -> None:
+            if self._github_extraction_tasks.get(capture_id) is done_task:
+                self._github_extraction_tasks.pop(capture_id, None)
+            if not done_task.cancelled():
+                exception = done_task.exception()
+                if exception is not None:
+                    logger.error(
+                        "GitHub extraction task crashed",
+                        exc_info=(type(exception), exception, exception.__traceback__),
+                    )
+
+        task.add_done_callback(_forget)
+
+    async def _extract_github_and_enrich(self, capture_id: uuid.UUID) -> None:
+        succeeded = await extract_github_capture(
+            capture_id,
+            settings=self.settings,
+            session_factory=self.session_factory,
+        )
+        if succeeded:
+            self.schedule_enrichment(capture_id)
+
+    def schedule_image_processing(self, capture_id: uuid.UUID) -> None:
+        """Queue durable image storage and vision processing."""
+
+        current_task = self._image_processing_tasks.get(capture_id)
+        if current_task is not None and not current_task.done():
+            return
+        task = asyncio.create_task(self._process_image_and_enrich(capture_id))
+        self._image_processing_tasks[capture_id] = task
+
+        def _forget(done_task: asyncio.Task[None]) -> None:
+            if self._image_processing_tasks.get(capture_id) is done_task:
+                self._image_processing_tasks.pop(capture_id, None)
+            if not done_task.cancelled():
+                exception = done_task.exception()
+                if exception is not None:
+                    logger.error(
+                        "Image processing task crashed",
+                        exc_info=(type(exception), exception, exception.__traceback__),
+                    )
+
+        task.add_done_callback(_forget)
+
+    async def _process_image_and_enrich(self, capture_id: uuid.UUID) -> None:
+        succeeded = await process_image_capture(
+            capture_id,
+            settings=self.settings,
+            session_factory=self.session_factory,
+            provider=self.provider,
+        )
+        if succeeded:
+            self.schedule_enrichment(capture_id, store_summary=False)
+
     def recover_pending_enrichment(self) -> None:
         """Resume captures left pending by a restart, up to the retry budget."""
 
@@ -1292,10 +1637,40 @@ class PersonalInboxDiscordClient(discord.Client):
         for capture_id in capture_ids:
             self.schedule_youtube_extraction(capture_id)
 
+    def recover_pending_github_extraction(self) -> None:
+        """Resume GitHub captures left before metadata extraction completed."""
+
+        session = self.session_factory()
+        try:
+            capture_ids = pending_github_ids(
+                session,
+                max_attempts=self.settings.enrichment_max_attempts,
+            )
+        finally:
+            session.close()
+        for capture_id in capture_ids:
+            self.schedule_github_extraction(capture_id)
+
+    def recover_pending_image_processing(self) -> None:
+        """Resume image captures left before vision processing completed."""
+
+        session = self.session_factory()
+        try:
+            capture_ids = pending_image_ids(
+                session,
+                max_attempts=self.settings.enrichment_max_attempts,
+            )
+        finally:
+            session.close()
+        for capture_id in capture_ids:
+            self.schedule_image_processing(capture_id)
+
     async def on_ready(self) -> None:
         logger.info("Discord bot connected as %s", self.user)
         self.recover_pending_web_extraction()
         self.recover_pending_youtube_extraction()
+        self.recover_pending_github_extraction()
+        self.recover_pending_image_processing()
         self.recover_pending_transcription()
         self.recover_pending_enrichment()
 
@@ -1309,4 +1684,6 @@ class PersonalInboxDiscordClient(discord.Client):
             transcription_scheduler=self.schedule_transcription,
             web_extraction_scheduler=self.schedule_web_extraction,
             youtube_extraction_scheduler=self.schedule_youtube_extraction,
+            github_extraction_scheduler=self.schedule_github_extraction,
+            image_processing_scheduler=self.schedule_image_processing,
         )

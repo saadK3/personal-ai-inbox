@@ -12,7 +12,13 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.channels.discord import _route_message, _search_captures, process_discord_message
 from app.core.config import Settings
 from app.models import Capture, MessageReceipt
-from app.providers.openai import EnrichmentResult, OpenAIProvider
+from app.providers.openai import EnrichmentResult, OpenAIProvider, VisionResult
+from app.services.github import (
+    GitHubMetadata,
+    canonicalize_github_url,
+    extract_github_url,
+    parse_github_url,
+)
 from app.services.webpage import WebpageMetadata
 from app.services.youtube import (
     YouTubeMetadata,
@@ -26,6 +32,17 @@ from app.workers.enrichment import (
     TRANSCRIPTION_UNSUPPORTED_STATUS,
     enrich_capture,
     transcribe_capture,
+)
+from app.workers.github import (
+    GITHUB_EXTRACTION_FAILED_STATUS,
+    GITHUB_EXTRACTION_PENDING_STATUS,
+    extract_github_capture,
+)
+from app.workers.image import (
+    IMAGE_FAILED_STATUS,
+    IMAGE_PENDING_STATUS,
+    IMAGE_UNSUPPORTED_STATUS,
+    process_image_capture,
 )
 from app.workers.webpage import (
     WEB_EXTRACTION_FAILED_STATUS,
@@ -71,6 +88,36 @@ class FakeAttachment:
     content_type: str | None = "audio/ogg"
     size: int = 128
     url: str = "https://cdn.discordapp.com/attachments/900/voice-note.ogg"
+
+
+@dataclass
+class FakeImageAttachment:
+    id: int = 901
+    filename: str = "screenshot.png"
+    content_type: str | None = "image/png"
+    size: int = 256
+    url: str = "https://cdn.discordapp.com/attachments/901/screenshot.png"
+
+
+class FakeVisionProvider:
+    def __init__(self, *, should_fail: bool = False) -> None:
+        self.should_fail = should_fail
+        self.calls: list[tuple[Path, str, str]] = []
+
+    def describe_image(
+        self,
+        image_path: Path,
+        mime_type: str,
+        user_context: str,
+    ) -> VisionResult:
+        self.calls.append((image_path, mime_type, user_context))
+        if self.should_fail:
+            raise RuntimeError("vision provider unavailable")
+        return VisionResult(
+            description="A screenshot of a settings page with a dark navigation bar.",
+            ocr_text="Settings Notifications",
+            uncertainty="The smallest text is slightly blurred.",
+        )
 
 
 class FakeProvider:
@@ -1166,3 +1213,416 @@ def test_openai_provider_passes_explicit_economical_models(tmp_path: Path) -> No
     assert embeddings.kwargs["dimensions"] == 1536
     assert transcriptions.kwargs["model"] == "gpt-4o-mini-transcribe"
     assert transcriptions.kwargs["response_format"] == "text"
+
+
+def test_github_urls_are_canonicalized_to_owner_repository_identity() -> None:
+    repository = "https://GitHub.com/OpenAI/openai-python.git/"
+    parsed = parse_github_url(repository)
+    assert parsed is not None
+    assert parsed.owner == "OpenAI"
+    assert parsed.repository == "openai-python"
+    assert parsed.canonical_url == "https://github.com/openai/openai-python"
+    assert canonicalize_github_url("https://github.com/openai/openai-python?tab=readme") == (
+        "https://github.com/openai/openai-python"
+    )
+    assert extract_github_url(f"Save this repo: {repository}") == repository
+    assert parse_github_url("https://github.com/openai/openai-python/issues") is None
+
+
+def test_github_url_is_persisted_before_extraction_and_duplicate_provenance(
+    session_factory: sessionmaker[Session],
+) -> None:
+    first = FakeMessage(100, "Use this SDK: https://github.com/openai/openai-python")
+    second = FakeMessage(101, "Same repo: https://GitHub.com/OpenAI/openai-python.git/")
+    scheduled: list[object] = []
+    settings = Settings(discord_allowed_user_id=123)
+
+    for message in (first, second):
+        asyncio.run(
+            process_discord_message(
+                message,
+                settings,
+                session_factory,
+                github_extraction_scheduler=scheduled.append,
+            )
+        )
+
+    assert first.channel.sent_messages == [
+        "Saved GitHub repository; metadata extraction started in the background."
+    ]
+    assert second.channel.sent_messages == [
+        "Saved GitHub repository; this URL was already captured, so I kept this submission "
+        "as a new provenance record. metadata extraction started in the background."
+    ]
+    with session_factory() as session:
+        captures = list(session.scalars(select(Capture).where(Capture.source_type == "github")))
+        assert len(captures) == 2
+        assert captures[0].source_metadata["url"] == "https://github.com/openai/openai-python"
+        assert captures[1].source_metadata["url"].endswith(".git/")
+        assert captures[1].source_metadata["duplicate_of"] == str(captures[0].id)
+        assert captures[0].source_metadata["canonical_url"] == captures[1].source_metadata[
+            "canonical_url"
+        ]
+        assert all(
+            capture.processing_status == GITHUB_EXTRACTION_PENDING_STATUS
+            for capture in captures
+        )
+        assert scheduled == [captures[0].id, captures[1].id]
+
+
+def _add_github_capture(
+    session_factory: sessionmaker[Session],
+    *,
+    message_id: int,
+    text: str = "Save this repo: https://github.com/openai/openai-python",
+) -> object:
+    with session_factory() as session:
+        capture = Capture(
+            platform="discord",
+            external_message_id=message_id,
+            conversation_id=456,
+            sender_id=123,
+            source_type="github",
+            raw_text=text,
+            source_metadata={
+                "url": "https://github.com/openai/openai-python",
+                "canonical_url": "https://github.com/openai/openai-python",
+                "submitted_text": text,
+            },
+            processing_status=GITHUB_EXTRACTION_PENDING_STATUS,
+        )
+        session.add(capture)
+        session.commit()
+        return capture.id
+
+
+def test_github_metadata_is_bounded_searchable_and_keeps_only_requested_fields(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture_id = _add_github_capture(session_factory, message_id=102)
+    metadata = GitHubMetadata(
+        url="https://github.com/openai/openai-python",
+        canonical_url="https://github.com/openai/openai-python",
+        owner="openai",
+        repository="openai-python",
+        description="The official Python library for the OpenAI API.",
+        topics=["openai", "python", "api"],
+        extraction_status="complete",
+    )
+    monkeypatch.setattr("app.workers.github.fetch_github_metadata", lambda url: metadata)
+    settings = Settings(discord_allowed_user_id=123)
+
+    assert asyncio.run(extract_github_capture(capture_id, settings, session_factory)) is True
+    with session_factory() as session:
+        capture = session.get(Capture, capture_id)
+        assert capture is not None
+        assert capture.processing_status == "captured"
+        assert capture.extraction_attempts == 1
+        github = capture.source_metadata["github"]
+        assert github["owner"] == "openai"
+        assert github["repository"] == "openai-python"
+        assert github["topics"] == ["openai", "python", "api"]
+        assert "official Python library" in capture.raw_text
+        assert "README" not in capture.raw_text
+        assert "license" not in capture.raw_text.casefold()
+
+    provider = FakeProvider()
+    assert (
+        asyncio.run(
+            enrich_capture(
+                capture_id,
+                settings,
+                session_factory,
+                provider,
+                store_summary=False,
+            )
+        )
+        is True
+    )
+    with session_factory() as session:
+        assert session.get(Capture, capture_id).summary is None
+    query = FakeMessage(103, "Did I save anything about the OpenAI Python API?")
+    asyncio.run(
+        process_discord_message(query, settings, session_factory, provider=provider)
+    )
+    response = query.channel.sent_messages[-1]
+    assert "openai/openai-python" in response
+    assert "official Python library" in response
+    assert "Topics: openai, python, api" in response
+    assert "https://github.com/openai/openai-python" in response
+    assert "Type: github" in response
+
+
+def test_github_extraction_failure_is_retryable_and_preserves_fallback_context(
+    session_factory: sessionmaker[Session],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capture_id = _add_github_capture(session_factory, message_id=104)
+    settings = Settings(discord_allowed_user_id=123)
+
+    def fail(_: str) -> GitHubMetadata:
+        raise RuntimeError("repository is private or unavailable")
+
+    monkeypatch.setattr("app.workers.github.fetch_github_metadata", fail)
+    assert asyncio.run(extract_github_capture(capture_id, settings, session_factory)) is False
+    with session_factory() as session:
+        failed = session.get(Capture, capture_id)
+        assert failed is not None
+        assert failed.processing_status == GITHUB_EXTRACTION_FAILED_STATUS
+        assert failed.processing_error == "repository is private or unavailable"
+        assert "openai/openai-python" in failed.raw_text
+
+    retry = FakeMessage(105, "/retry")
+    scheduled: list[object] = []
+    asyncio.run(
+        process_discord_message(
+            retry,
+            settings,
+            session_factory,
+            github_extraction_scheduler=scheduled.append,
+        )
+    )
+    assert retry.channel.sent_messages == [
+        "Retrying GitHub metadata extraction for: https://github.com/openai/openai-python"
+    ]
+    assert scheduled == [capture_id]
+
+    fallback = GitHubMetadata(
+        url="https://github.com/openai/openai-python",
+        canonical_url="https://github.com/openai/openai-python",
+        owner="openai",
+        repository="openai-python",
+        extraction_status="metadata_only",
+        error="metadata unavailable",
+    )
+    monkeypatch.setattr("app.workers.github.fetch_github_metadata", lambda url: fallback)
+    assert asyncio.run(extract_github_capture(capture_id, settings, session_factory)) is True
+    with session_factory() as session:
+        recovered = session.get(Capture, capture_id)
+        assert recovered is not None
+        assert recovered.processing_status == "captured"
+        assert recovered.processing_error is None
+        assert recovered.extraction_attempts == 2
+        assert recovered.source_metadata["github"]["extraction_status"] == "metadata_only"
+        assert "openai-python" in recovered.raw_text
+
+
+def test_image_attachment_is_persisted_before_vision_and_scheduled(
+    session_factory: sessionmaker[Session],
+) -> None:
+    message = FakeMessage(
+        110,
+        "Screenshot of the settings page",
+        attachments=[FakeImageAttachment()],
+    )
+    scheduled: list[object] = []
+    settings = Settings(discord_allowed_user_id=123)
+    asyncio.run(
+        process_discord_message(
+            message,
+            settings,
+            session_factory,
+            image_processing_scheduler=scheduled.append,
+        )
+    )
+
+    assert message.channel.sent_messages == [
+        "Image saved; vision processing started in the background."
+    ]
+    with session_factory() as session:
+        capture = session.scalar(select(Capture).where(Capture.external_message_id == 110))
+        assert capture is not None
+        assert capture.source_type == "image"
+        assert capture.raw_text == "Screenshot of the settings page"
+        assert capture.processing_status == IMAGE_PENDING_STATUS
+        assert capture.source_metadata["image"]["url"].endswith("screenshot.png")
+        assert capture.source_metadata["submitted_text"] == message.content
+        assert scheduled == [capture.id]
+
+
+def _add_image_capture(
+    session_factory: sessionmaker[Session],
+    *,
+    message_id: int,
+    image_path: Path,
+    text: str = "Screenshot of the settings page",
+) -> object:
+    with session_factory() as session:
+        capture = Capture(
+            platform="discord",
+            external_message_id=message_id,
+            conversation_id=456,
+            sender_id=123,
+            source_type="image",
+            raw_text=text,
+            source_metadata={
+                "submitted_text": text,
+                "image": {
+                    "filename": "screenshot.png",
+                    "content_type": "image/png",
+                    "url": "https://cdn.discordapp.com/screenshot.png",
+                    "local_path": str(image_path),
+                },
+            },
+            processing_status=IMAGE_PENDING_STATUS,
+        )
+        session.add(capture)
+        session.commit()
+        return capture.id
+
+
+def test_image_processing_stores_durable_copy_vision_fields_and_searches(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "screenshot.png"
+    image_path.write_bytes(b"fake png bytes")
+    capture_id = _add_image_capture(session_factory, message_id=111, image_path=image_path)
+    settings = Settings(discord_allowed_user_id=123, storage_dir=tmp_path)
+    vision = FakeVisionProvider()
+
+    assert (
+        asyncio.run(
+            process_image_capture(capture_id, settings, session_factory, provider=vision)
+        )
+        is True
+    )
+    with session_factory() as session:
+        capture = session.get(Capture, capture_id)
+        assert capture is not None
+        assert capture.processing_status == "captured"
+        assert capture.vision_attempts == 1
+        image = capture.source_metadata["image"]
+        assert image["local_path"] == str(image_path)
+        assert image["description"].startswith("A screenshot")
+        assert image["ocr_text"] == "Settings Notifications"
+        assert image["uncertainty"]
+        assert "Settings Notifications" in capture.raw_text
+        assert vision.calls == [(image_path, "image/png", "Screenshot of the settings page")]
+
+    provider = FakeProvider()
+    assert (
+        asyncio.run(
+            enrich_capture(
+                capture_id,
+                settings,
+                session_factory,
+                provider,
+                store_summary=False,
+            )
+        )
+        is True
+    )
+    with session_factory() as session:
+        assert session.get(Capture, capture_id).summary is None
+    query = FakeMessage(112, "Did I save anything about settings?")
+    asyncio.run(process_discord_message(query, settings, session_factory, provider=provider))
+    response = query.channel.sent_messages[-1]
+    assert "A screenshot of a settings page" in response
+    assert "Visible text: Settings Notifications" in response
+    assert "https://cdn.discordapp.com/screenshot.png" in response
+    assert "Type: image" in response
+
+
+def test_image_failure_retry_and_unsupported_format_are_safe(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "screenshot.png"
+    image_path.write_bytes(b"fake png bytes")
+    capture_id = _add_image_capture(session_factory, message_id=113, image_path=image_path)
+    settings = Settings(discord_allowed_user_id=123, storage_dir=tmp_path)
+    failing_vision = FakeVisionProvider(should_fail=True)
+    assert (
+        asyncio.run(
+            process_image_capture(capture_id, settings, session_factory, provider=failing_vision)
+        )
+        is False
+    )
+    with session_factory() as session:
+        failed = session.get(Capture, capture_id)
+        assert failed is not None
+        assert failed.processing_status == IMAGE_FAILED_STATUS
+        assert failed.processing_error == "vision provider unavailable"
+        assert failed.vision_attempts == 1
+        assert failed.raw_text == "Screenshot of the settings page"
+        assert failed.source_metadata["image"]["local_path"] == str(image_path)
+
+    retry = FakeMessage(114, "/retry")
+    scheduled: list[object] = []
+    asyncio.run(
+        process_discord_message(
+            retry,
+            settings,
+            session_factory,
+            image_processing_scheduler=scheduled.append,
+        )
+    )
+    assert retry.channel.sent_messages == [
+        "Retrying image processing for: screenshot.png"
+    ]
+    assert scheduled == [capture_id]
+
+    unsupported = FakeMessage(
+        115,
+        "A format we cannot inspect yet",
+        attachments=[FakeImageAttachment(filename="scan.heic", content_type="image/heic")],
+    )
+    unsupported_scheduled: list[object] = []
+    asyncio.run(
+        process_discord_message(
+            unsupported,
+            settings,
+            session_factory,
+            image_processing_scheduler=unsupported_scheduled.append,
+        )
+    )
+    assert unsupported.channel.sent_messages == [
+        "Image saved, but I can’t process it: unsupported image format (scan.heic)."
+    ]
+    assert unsupported_scheduled == []
+    with session_factory() as session:
+        capture = session.scalar(select(Capture).where(Capture.external_message_id == 115))
+        assert capture is not None
+        assert capture.processing_status == IMAGE_UNSUPPORTED_STATUS
+        assert capture.processing_error == "unsupported image format (scan.heic)"
+        assert capture.source_metadata["image"]["url"]
+
+
+def test_openai_provider_uses_low_detail_vision_input_and_configured_model(tmp_path: Path) -> None:
+    class FakeResponses:
+        def __init__(self) -> None:
+            self.kwargs: dict[str, object] = {}
+
+        def create(self, **kwargs: object) -> SimpleNamespace:
+            self.kwargs = kwargs
+            return SimpleNamespace(
+                output_text=json.dumps(
+                    {
+                        "description": "A screenshot of a settings page.",
+                        "ocr_text": "Settings",
+                        "uncertainty": "",
+                    }
+                )
+            )
+
+    responses = FakeResponses()
+    provider = OpenAIProvider(
+        Settings(openai_api_key="test-key"),
+        client=SimpleNamespace(responses=responses),
+    )
+    image_path = tmp_path / "screen.png"
+    image_path.write_bytes(b"fake image")
+    result = provider.describe_image(image_path, "image/png", "Settings screenshot")
+
+    assert result.description == "A screenshot of a settings page."
+    assert result.ocr_text == "Settings"
+    assert result.uncertainty is None
+    assert responses.kwargs["model"] == "gpt-5.6-luna"
+    request_input = responses.kwargs["input"]
+    assert isinstance(request_input, list)
+    content = request_input[0]["content"]
+    assert content[1]["type"] == "input_image"
+    assert content[1]["detail"] == "low"
+    assert str(content[1]["image_url"]).startswith("data:image/png;base64,")

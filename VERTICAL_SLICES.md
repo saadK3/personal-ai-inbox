@@ -32,7 +32,7 @@ Project scaffolding and development-environment setup are enabling work, not a p
 | 4 | Natural save/query routing | Ask naturally without always typing `/ask` |
 | 5 | Voice-note memory | Send a voice note, have it transcribed, and find it later |
 | 6 | Webpage memory | Send an article or URL, save bounded metadata, and retrieve it |
-| 7 | YouTube memory | Save a YouTube video with metadata or transcript and find it later |
+| 7 | YouTube memory | Save a YouTube video with bounded metadata and find it later |
 | 8 | GitHub repository memory | Save a repository with useful metadata and retrieve it |
 | 9 | Image and screenshot memory | Send an image, understand its contents, and find it later |
 | 10 | Manage and correct memories | Delete, undo, correct, complete, and inspect saved items |
@@ -199,14 +199,17 @@ A failed extraction must still produce a saved and retrievable URL item.
 
 ### End-to-end scope
 
-- Recognize GitHub repository URLs.
-- Preserve the submitted URL immediately.
-- Extract the owner, repository name, description, topics, and primary language when available.
-- Extract README content where practical.
-- Produce a searchable summary and embedding.
-- Retrieve the result with the original repository URL.
-- Handle deleted, private, inaccessible, and rate-limited repositories.
-- Test full-metadata and metadata-only fallback paths.
+- Recognize GitHub repository URLs and canonicalize owner/repository identity for duplicates.
+- Preserve the exact submitted URL and accompanying note immediately.
+- Extract only the owner, repository name, description, and topics from the repository API.
+- Produce a bounded searchable representation with the user's context and embed it through the
+  existing retrieval pipeline.
+- Retrieve a concise repository identity/description/topics result with the original URL.
+- Handle deleted, private, inaccessible, malformed, and rate-limited repositories safely while
+  retaining the URL and note as fallback context.
+- Preserve duplicate provenance and support extraction retry.
+- Do not fetch languages, license, README, source files, dependencies, issues, or history.
+- Test complete metadata, metadata-only/failure fallback, duplicate, malformed, and retry paths.
 
 The system must not clone or analyze entire repositories during normal V1 ingestion.
 
@@ -218,16 +221,19 @@ The system must not clone or analyze entire repositories during normal V1 ingest
 
 ### End-to-end scope
 
-- Receive images through Discord.
-- Persist the capture and Discord attachment metadata before visual processing.
-- Preserve a durable original image reference or stored copy.
-- Generate a factual, retrieval-oriented visual description.
-- Extract visible text when useful.
-- Produce a summary and embedding from the available evidence.
-- Retrieve results with access to the original image.
-- Communicate uncertainty rather than inventing visual details.
-- Track and retry vision-processing failures.
-- Test screenshots with text, ordinary photos, ambiguous images, and provider failures.
+- Receive supported image attachments through Discord and persist capture/attachment metadata
+  before visual processing.
+- Preserve the original attachment reference and a durable local image copy when available.
+- Generate one concise, factual, retrieval-oriented visual description and extract legible
+  visible text when useful.
+- Index the description, OCR, user context, and filename through the existing embedding pipeline;
+  do not generate or store a separate summary.
+- Retrieve results with the original attachment URL, description, visible text, and uncertainty.
+- Communicate ambiguity rather than inventing visual details, identifying people, or inferring
+  sensitive/private attributes.
+- Track unsupported formats and vision/download failures, preserve the capture, and support retry.
+- Test screenshots with text, ordinary photos, ambiguous images, unsupported formats, and provider
+  failures.
 
 ## Slice 10 — Manage and correct memories
 
