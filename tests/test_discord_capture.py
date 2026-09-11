@@ -1525,6 +1525,43 @@ def test_image_processing_stores_durable_copy_vision_fields_and_searches(
     assert "Type: image" in response
 
 
+def test_image_processing_handles_a_photo_without_visible_text(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "photo.jpg"
+    image_path.write_bytes(b"fake jpeg bytes")
+    capture_id = _add_image_capture(session_factory, message_id=116, image_path=image_path)
+    settings = Settings(discord_allowed_user_id=123, storage_dir=tmp_path)
+
+    class PhotoVisionProvider:
+        def describe_image(
+            self,
+            image_path: Path,
+            mime_type: str,
+            user_context: str,
+        ) -> VisionResult:
+            return VisionResult(description="A photo of a bowl of fruit.")
+
+    assert (
+        asyncio.run(
+            process_image_capture(
+                capture_id,
+                settings,
+                session_factory,
+                provider=PhotoVisionProvider(),
+            )
+        )
+        is True
+    )
+    with session_factory() as session:
+        capture = session.get(Capture, capture_id)
+        assert capture is not None
+        assert capture.source_metadata["image"]["description"] == "A photo of a bowl of fruit."
+        assert capture.source_metadata["image"]["ocr_text"] is None
+        assert capture.source_metadata["image"]["uncertainty"] is None
+
+
 def test_image_failure_retry_and_unsupported_format_are_safe(
     session_factory: sessionmaker[Session],
     tmp_path: Path,
