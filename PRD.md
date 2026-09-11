@@ -159,14 +159,17 @@ Corrections must not change or destroy the original captured content.
 ### YouTube links
 
 - Preserve the submitted URL.
-- Extract available title and metadata.
-- Retrieve a transcript when it is straightforward and permitted.
-- Transcript failure must not block saving the video.
+- Extract bounded title, channel, publication date, and a short description when available.
+- Make the video searchable by its metadata and the user's accompanying note.
+- Do not download video bytes or store transcripts, chapters, summaries, or key takeaways in V1.
+- Metadata failure must not block saving the video.
 
 ### GitHub repositories
 
-- Treat these as URLs with repository-specific metadata when available, such as owner, repository name, description, and primary language.
-- Do not clone repositories during normal ingestion in V1.
+- Treat these as URLs with repository-specific metadata limited to owner, repository name,
+  description, and topics.
+- Do not fetch the README, source tree, dependencies, issues, history, languages, or license;
+  do not clone repositories during normal ingestion in V1.
 
 ### Images and screenshots
 
@@ -174,7 +177,9 @@ Corrections must not change or destroy the original captured content.
 - Store the image durably according to the selected storage policy.
 - Use a vision-capable model to create a factual retrieval-oriented description.
 - Extract visible text when useful.
-- Do not claim uncertain visual details as facts.
+- Index the description, visible text, filename, and user's context for retrieval without a
+  separate generated summary in V1.
+- Communicate uncertainty and do not identify people or infer private or sensitive attributes.
 
 ## 7. Conceptual data model
 
@@ -316,7 +321,9 @@ V1 is considered usable when all of the following are true:
 1. The authorized user can send text, a voice note, a URL, a YouTube link, a GitHub link, and an image to the bot.
 2. Every supported submission is durably stored and acknowledged even if later enrichment fails.
 3. The user can inspect the original content and its processing state.
-4. Successful processing produces searchable normalized text, a summary, metadata, and an embedding.
+4. Successful processing produces a bounded searchable representation, metadata, and an embedding;
+   text/voice/webpage captures also receive a generated summary, while YouTube, GitHub, and image
+   captures rely on their source-specific metadata and context.
 5. The user can ask natural-language questions and receive grounded results containing source and date information.
 6. Retrieval handles both conceptual questions and exact identifying terms.
 7. The bot does not fabricate a saved item when no credible result exists.
