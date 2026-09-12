@@ -2,7 +2,9 @@
 
 A private Discord DM inbox for capturing miscellaneous parts of everyday life and retrieving them later with natural language.
 
-The product requirements are in [PRD.md](PRD.md), and the implementation plan is in [VERTICAL_SLICES.md](VERTICAL_SLICES.md).
+The product requirements are in [PRD.md](PRD.md), the implementation plan is in
+[VERTICAL_SLICES.md](VERTICAL_SLICES.md), and the end-to-end QA checklist is in
+[TEST_CASES.md](TEST_CASES.md).
 
 ## Current status
 
