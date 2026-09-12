@@ -6,7 +6,7 @@ The product requirements are in [PRD.md](PRD.md), and the implementation plan is
 
 ## Current status
 
-The repository contains the development scaffold and the first nine product slices. It includes:
+The repository contains the development scaffold and the first ten product slices. It includes:
 
 - FastAPI application with liveness and database-readiness endpoints
 - Discord Gateway bot for private DM capture
@@ -19,8 +19,9 @@ The repository contains the development scaffold and the first nine product slic
 Vertical Slices 1 and 2—private Discord text capture and exact text retrieval—
 are implemented, Slice 3 adds semantic memory and hybrid retrieval, Slice 4 adds
 natural save/query routing, Slice 5 adds voice-note memory, Slice 6 adds webpage
-memory, Slice 7 adds YouTube memory, Slice 8 adds GitHub repository memory, and
-Slice 9 adds image/screenshot memory. Text captures, voice-note transcripts,
+memory, Slice 7 adds YouTube memory, Slice 8 adds GitHub repository memory, Slice 9
+adds image/screenshot memory, and Slice 10 adds user-controlled management and
+corrections. Text captures, voice-note transcripts,
 webpage metadata, YouTube metadata, GitHub metadata, and image descriptions/OCR are
 acknowledged first, then processed asynchronously. Text, voice, and webpage captures
 also receive normalized text, a summary, type, topics, entities, and an embedding;
@@ -128,7 +129,12 @@ transcription, metadata, vision, or enrichment failures, and `/retry` retries
 the latest failed stage. GitHub repository links use only the repository identity,
 description, and topics. Image attachments are copied locally and analyzed for a
 factual description and visible text; unsupported formats are saved with a clear
-status and can be retrieved by their original attachment URL.
+status and can be retrieved by their original attachment URL. `/recent` shows
+numbered items and short IDs for management commands: `/inspect <item>` displays
+the original context and source, `/delete <item>` soft-deletes an item, `/complete
+<item>` marks it complete, and `/correct <item> <summary|type|meaning> <value>`
+updates derived fields while preserving the original capture. `/undo` safely
+removes the latest capture and will not remove an older item on a second attempt.
 
 Run checks:
 

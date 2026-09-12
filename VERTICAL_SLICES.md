@@ -243,16 +243,21 @@ The system must not clone or analyze entire repositories during normal V1 ingest
 
 ### End-to-end scope
 
-- Inspect a saved item and its source.
-- Delete a selected item.
-- Complete the basic undo behavior introduced in Slice 1.
-- Correct an item's summary, type, or meaning.
-- Mark an actionable item as completed.
-- Preserve the immutable original capture when derived information is corrected.
-- Exclude deleted items from normal retrieval.
-- Treat completed items appropriately during retrieval.
-- Store corrections as feedback signals.
-- Test deletion, correction, completion, and retrieval-state behavior.
+- Show numbered items and short IDs in `/recent` so a user can select a stable capture.
+- Inspect a selected item with `/inspect <item>`, including original context, derived fields,
+  processing state, and the source reference.
+- Soft-delete a selected item with `/delete <item>` while retaining the capture for audit.
+- Complete the basic undo behavior introduced in Slice 1; a second undo cannot remove an older
+  capture after the latest one is already deleted.
+- Correct an item's summary, type, or meaning with `/correct <item> <field> <value>`.
+- Preserve raw/original capture text and record each correction in an audit trail.
+- Reapply corrections after a later enrichment run and invalidate stale embeddings when meaning
+  changes.
+- Mark an actionable item completed with `/complete <item>` and expose completion state in recent
+  and search results without hiding the item.
+- Exclude deleted items from normal retrieval and restrict every mutation to the allowlisted user.
+- Test deletion, undo, inspection, correction persistence, completion, authorization, and
+  retrieval-state behavior through Discord.
 
 ## Slice 11 — Related-memory discovery
 

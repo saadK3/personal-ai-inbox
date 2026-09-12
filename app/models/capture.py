@@ -7,6 +7,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     DateTime,
+    ForeignKey,
     Index,
     Integer,
     String,
@@ -81,6 +82,7 @@ class Capture(Base):
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1536), nullable=True)
     embedding_model: Mapped[str | None] = mapped_column(String(128), nullable=True)
     processed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
@@ -100,6 +102,34 @@ class MessageReceipt(Base):
     conversation_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     sender_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     received_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+
+class CaptureCorrection(Base):
+    """Audit trail for user edits to derived capture fields."""
+
+    __tablename__ = "capture_corrections"
+    __table_args__ = (
+        Index("ix_capture_corrections_capture_created_at", "capture_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    capture_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("captures.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    field: Mapped[str] = mapped_column(String(64), nullable=False)
+    old_value: Mapped[Any | None] = mapped_column(
+        JSON().with_variant(JSONB(), "postgresql"),
+        nullable=True,
+    )
+    new_value: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,
         default=lambda: datetime.now(UTC),

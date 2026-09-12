@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import Settings
 from app.models.capture import Capture
 from app.providers.openai import EnrichmentProvider, OpenAIProvider
+from app.services.management import latest_corrections
 
 logger = logging.getLogger(__name__)
 PROCESSING_STATUS = "processing"
@@ -244,7 +245,15 @@ async def enrich_capture(
         active_provider = provider or OpenAIProvider(settings)
         # The SDK is synchronous. Keep both network calls off Discord's event loop.
         result = await asyncio.to_thread(active_provider.enrich, raw_text)
-        embedding = await asyncio.to_thread(active_provider.embed, result.normalized_text)
+        corrections_session = session_factory()
+        try:
+            corrections = latest_corrections(corrections_session, capture_id)
+        finally:
+            corrections_session.close()
+        normalized_text = corrections.get("meaning", result.normalized_text)
+        summary = corrections.get("summary", result.summary)
+        inferred_type = corrections.get("type", result.inferred_type)
+        embedding = await asyncio.to_thread(active_provider.embed, normalized_text)
     except Exception as exc:
         logger.exception("Capture enrichment failed", extra={"capture_id": str(capture_id)})
         failure_session = session_factory()
@@ -263,9 +272,9 @@ async def enrich_capture(
         processed_capture = success_session.get(Capture, capture_id)
         if processed_capture is None or processed_capture.deleted_at is not None:
             return False
-        processed_capture.normalized_text = result.normalized_text
-        processed_capture.summary = result.summary if store_summary else None
-        processed_capture.inferred_type = result.inferred_type
+        processed_capture.normalized_text = normalized_text
+        processed_capture.summary = summary if store_summary else None
+        processed_capture.inferred_type = inferred_type
         processed_capture.topics = result.topics
         processed_capture.entities = result.entities
         processed_capture.embedding = embedding

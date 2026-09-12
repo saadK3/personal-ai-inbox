@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from app.channels.discord import _route_message, _search_captures, process_discord_message
 from app.core.config import Settings
-from app.models import Capture, MessageReceipt
+from app.models import Capture, CaptureCorrection, MessageReceipt
 from app.providers.openai import EnrichmentResult, OpenAIProvider, VisionResult
 from app.services.github import (
     GitHubMetadata,
@@ -1663,3 +1663,158 @@ def test_openai_provider_uses_low_detail_vision_input_and_configured_model(tmp_p
     assert content[1]["type"] == "input_image"
     assert content[1]["detail"] == "low"
     assert str(content[1]["image_url"]).startswith("data:image/png;base64,")
+
+
+def test_management_recent_inspect_delete_and_retrieval_state(
+    session_factory: sessionmaker[Session],
+) -> None:
+    first = FakeMessage(200, "First management note")
+    second = FakeMessage(201, "Second management note")
+    recent = FakeMessage(202, "/recent")
+    inspect = FakeMessage(203, "/inspect 1")
+    delete = FakeMessage(204, "/delete 1")
+    run_message(first, session_factory)
+    run_message(second, session_factory)
+    run_message(recent, session_factory)
+    run_message(inspect, session_factory)
+    run_message(delete, session_factory)
+
+    assert "#1 id:" in recent.channel.sent_messages[-1]
+    assert "Second management note" in recent.channel.sent_messages[-1]
+    assert "Original: Second management note" in inspect.channel.sent_messages[-1]
+    assert "https://discord.com/channels/@me/456/201" in inspect.channel.sent_messages[-1]
+    assert delete.channel.sent_messages[-1].startswith("Deleted capture ")
+    with session_factory() as session:
+        deleted = session.scalar(select(Capture).where(Capture.external_message_id == 201))
+        assert deleted is not None
+        assert deleted.deleted_at is not None
+        assert deleted.raw_text == "Second management note"
+
+        matches = _search_captures(session, 456, "second")
+        assert matches == []
+
+    # A deleted item can still be inspected by its UUID prefix for auditability.
+    with session_factory() as session:
+        deleted = session.scalar(select(Capture).where(Capture.external_message_id == 201))
+        assert deleted is not None
+        prefix = str(deleted.id)[:8]
+    inspect_deleted = FakeMessage(205, f"/inspect {prefix}")
+    run_message(inspect_deleted, session_factory)
+    assert "Status: captured" in inspect_deleted.channel.sent_messages[-1]
+    assert "Original: Second management note" in inspect_deleted.channel.sent_messages[-1]
+
+
+def test_undo_is_idempotent_and_does_not_delete_an_older_capture(
+    session_factory: sessionmaker[Session],
+) -> None:
+    run_message(FakeMessage(210, "Keep this older note"), session_factory)
+    run_message(FakeMessage(211, "Undo this newest note"), session_factory)
+    first_undo = FakeMessage(212, "/undo")
+    second_undo = FakeMessage(213, "/undo")
+    run_message(first_undo, session_factory)
+    run_message(second_undo, session_factory)
+
+    assert first_undo.channel.sent_messages == ["Undid: Undo this newest note"]
+    assert second_undo.channel.sent_messages == ["The latest capture is already deleted."]
+    with session_factory() as session:
+        captures = list(
+            session.scalars(
+                select(Capture).order_by(Capture.created_at.asc(), Capture.id.asc())
+            )
+        )
+        assert captures[0].deleted_at is None
+        assert captures[1].deleted_at is not None
+
+
+def test_corrections_are_audited_searchable_and_survive_re_enrichment(
+    session_factory: sessionmaker[Session],
+) -> None:
+    original = FakeMessage(220, "A friend recommended a ramen restaurant near F7")
+    run_message(original, session_factory)
+    settings = Settings(discord_allowed_user_id=123)
+    provider = FakeProvider()
+    with session_factory() as session:
+        capture = session.scalar(select(Capture).where(Capture.external_message_id == 220))
+        assert capture is not None
+        capture_id = capture.id
+    assert asyncio.run(enrich_capture(capture_id, settings, session_factory, provider)) is True
+
+    correction_messages = (
+        (221, "/correct 1 meaning friend recommended a Japanese ramen restaurant in F7"),
+        (222, "/correct 1 summary Ramen recommendation from a friend"),
+        (223, "/correct 1 type recommendation"),
+    )
+    scheduled: list[object] = []
+    for message_id, content in correction_messages:
+        asyncio.run(
+            process_discord_message(
+                FakeMessage(message_id, content),
+                settings,
+                session_factory,
+                enrichment_scheduler=scheduled.append,
+            )
+        )
+
+    with session_factory() as session:
+        capture = session.get(Capture, capture_id)
+        assert capture is not None
+        assert capture.raw_text == original.content
+        assert capture.normalized_text == "friend recommended a Japanese ramen restaurant in F7"
+        assert capture.summary == "Ramen recommendation from a friend"
+        assert capture.inferred_type == "recommendation"
+        corrections = list(
+            session.scalars(
+                select(CaptureCorrection)
+                .where(CaptureCorrection.capture_id == capture_id)
+                .order_by(CaptureCorrection.created_at.asc(), CaptureCorrection.id.asc())
+            )
+        )
+        assert [correction.field for correction in corrections] == [
+            "meaning",
+            "summary",
+            "type",
+        ]
+        assert scheduled == [capture_id, capture_id, capture_id]
+
+    # The next enrichment call must overlay the audit trail instead of losing edits.
+    assert asyncio.run(enrich_capture(capture_id, settings, session_factory, provider)) is True
+    with session_factory() as session:
+        capture = session.get(Capture, capture_id)
+        assert capture is not None
+        assert capture.raw_text == original.content
+        assert capture.normalized_text == "friend recommended a Japanese ramen restaurant in F7"
+        assert capture.summary == "Ramen recommendation from a friend"
+        assert capture.inferred_type == "recommendation"
+
+    query = FakeMessage(224, "Did I save anything about Japanese ramen?")
+    asyncio.run(process_discord_message(query, settings, session_factory, provider=provider))
+    response = query.channel.sent_messages[-1]
+    assert "Ramen recommendation from a friend" in response
+    assert original.content in response
+
+
+def test_completion_is_visible_and_authorization_protects_mutations(
+    session_factory: sessionmaker[Session],
+) -> None:
+    run_message(FakeMessage(230, "Submit the project report"), session_factory)
+    complete = FakeMessage(231, "/complete 1")
+    run_message(complete, session_factory)
+    complete_again = FakeMessage(232, "/complete 1")
+    run_message(complete_again, session_factory)
+    recent = FakeMessage(233, "/recent")
+    run_message(recent, session_factory)
+    query = FakeMessage(234, "/ask project report")
+    run_message(query, session_factory)
+
+    assert "Marked capture" in complete.channel.sent_messages[-1]
+    assert "already complete" in complete_again.channel.sent_messages[-1]
+    assert "completed" in recent.channel.sent_messages[-1]
+    assert "Status: completed" in query.channel.sent_messages[-1]
+
+    unauthorized = FakeMessage(235, "/delete 1", author=FakeAuthor(id=999))
+    run_message(unauthorized, session_factory)
+    with session_factory() as session:
+        capture = session.scalar(select(Capture).where(Capture.external_message_id == 230))
+        assert capture is not None
+        assert capture.deleted_at is None
+        assert capture.completed_at is not None

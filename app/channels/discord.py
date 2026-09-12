@@ -16,6 +16,13 @@ from app.core.config import Settings
 from app.models.capture import Capture, MessageReceipt
 from app.providers.openai import EnrichmentProvider, OpenAIProvider
 from app.services.github import canonicalize_github_url, extract_github_url
+from app.services.management import (
+    CORRECTABLE_FIELDS,
+    apply_correction,
+    correction_help,
+    latest_capture,
+    resolve_capture,
+)
 from app.services.webpage import canonicalize_url, extract_url
 from app.services.youtube import canonicalize_youtube_url, extract_youtube_url
 from app.workers.enrichment import (
@@ -252,12 +259,51 @@ def _format_recent(captures: list[Capture]) -> str:
         )
         if len(text) > 280:
             text = f"{text[:277]}..."
-        lines.append(f"{index}. [{timestamp}] ({capture.processing_status}) {text}")
+        status = capture.processing_status
+        if capture.completed_at is not None:
+            status = f"{status}, completed"
+        lines.append(f"{index}. [{timestamp}] (#{index} id:{str(capture.id)[:8]} {status}) {text}")
         if capture.processing_error:
             lines.append(f"   Error: {_truncate(capture.processing_error, 240)}")
         if len("\n".join(lines)) > DISCORD_MESSAGE_LIMIT - 20:
             lines.append("...more captures available later")
             break
+    return _truncate("\n".join(lines))
+
+
+def _capture_original_text(capture: Capture) -> str:
+    metadata = capture.source_metadata or {}
+    submitted_text = metadata.get("submitted_text")
+    if isinstance(submitted_text, str) and submitted_text.strip():
+        return submitted_text
+    if capture.source_type == "voice" and capture.raw_transcription:
+        return capture.raw_transcription
+    return capture.raw_text
+
+
+def _format_inspect(capture: Capture) -> str:
+    metadata = capture.source_metadata or {}
+    status = capture.processing_status
+    if capture.completed_at is not None:
+        status = f"{status}; completed"
+    lines = [
+        f"Capture {capture.id}",
+        f"Type: {capture.source_type}",
+        f"Status: {status}",
+        f"Original: {_truncate(_capture_original_text(capture), 700)}",
+        f"Search text: {_truncate(capture.raw_text, 700)}",
+        f"Source: {_capture_source(capture)}",
+    ]
+    if capture.summary:
+        lines.append(f"Summary: {_truncate(capture.summary, 500)}")
+    if capture.inferred_type:
+        lines.append(f"Inferred type: {_truncate(capture.inferred_type, 160)}")
+    if capture.topics:
+        lines.append(f"Topics: {_truncate(', '.join(capture.topics), 300)}")
+    if capture.processing_error:
+        lines.append(f"Processing error: {_truncate(capture.processing_error, 400)}")
+    if isinstance(metadata.get("url"), str):
+        lines.append(f"Submitted URL: {metadata['url']}")
     return _truncate("\n".join(lines))
 
 
@@ -424,6 +470,8 @@ def _format_search_results(captures: list[Capture], query: str) -> str:
                         f"   Uncertainty: {_truncate(str(image['uncertainty']), 240)}"
                     )
             lines.append("   Type: image")
+        if capture.completed_at is not None:
+            lines.append("   Status: completed")
         if capture.summary and capture.source_type not in {"youtube", "github", "image"}:
             lines.append(f"   Summary: {_truncate(capture.summary, 240)}")
         lines.append(f"   Source: {_capture_source(capture)}")
@@ -897,13 +945,15 @@ async def process_discord_message(
             command_name, _ = command
             retry_capture: Capture | None = None
             save_capture: Capture | None = None
+            correction_capture: Capture | None = None
             if command_name in {"/start", "/help"}:
                 response_text = (
                     "Send me a note and I’ll save it, or ask a clear question "
                     "naturally to search. Use /recent to review captures, "
                     "/ask <query> to search explicitly, /save <text> to force "
                     "a save, send a URL to save its metadata, /retry to "
-                    "reprocess a failed capture, or /undo to remove the latest one."
+                    "reprocess a failed capture, /inspect <item>, /delete <item>, "
+                    "/complete <item>, /correct <item> <field> <value>, or /undo."
                 )
             elif command_name == "/recent":
                 captures = list(
@@ -920,21 +970,93 @@ async def process_discord_message(
                 )
                 response_text = _format_recent(captures)
             elif command_name == "/undo":
-                capture = session.scalar(
-                    select(Capture)
-                    .where(
-                        Capture.platform == PLATFORM,
-                        Capture.conversation_id == message.channel.id,
-                        Capture.deleted_at.is_(None),
-                    )
-                    .order_by(Capture.created_at.desc(), Capture.id.desc())
-                    .limit(1)
-                )
+                capture = latest_capture(session, conversation_id=message.channel.id)
                 if capture is None:
                     response_text = "There is nothing to undo."
+                elif capture.deleted_at is not None:
+                    response_text = "The latest capture is already deleted."
                 else:
                     capture.deleted_at = datetime.now(UTC)
-                    response_text = f"Undid: {capture.raw_text}"
+                    response_text = f"Undid: {_capture_original_text(capture)}"
+            elif command_name == "/inspect":
+                if not command[1]:
+                    response_text = (
+                        "Usage: /inspect <item>. Use /recent to see item numbers and IDs."
+                    )
+                else:
+                    capture = resolve_capture(
+                        session,
+                        conversation_id=message.channel.id,
+                        selector=command[1],
+                        include_deleted=True,
+                    )
+                    response_text = (
+                        _format_inspect(capture)
+                        if capture is not None
+                        else "No capture matched that item number or ID."
+                    )
+            elif command_name == "/delete":
+                if not command[1]:
+                    response_text = (
+                        "Usage: /delete <item>. Use /recent to see item numbers and IDs."
+                    )
+                else:
+                    capture = resolve_capture(
+                        session,
+                        conversation_id=message.channel.id,
+                        selector=command[1],
+                    )
+                    if capture is None:
+                        response_text = "No active capture matched that item number or ID."
+                    else:
+                        capture.deleted_at = datetime.now(UTC)
+                        response_text = (
+                            f"Deleted capture {str(capture.id)[:8]}. The original record "
+                            "remains available for audit."
+                        )
+            elif command_name == "/complete":
+                if not command[1]:
+                    response_text = (
+                        "Usage: /complete <item>. Use /recent to see item numbers and IDs."
+                    )
+                else:
+                    capture = resolve_capture(
+                        session,
+                        conversation_id=message.channel.id,
+                        selector=command[1],
+                    )
+                    if capture is None:
+                        response_text = "No active capture matched that item number or ID."
+                    elif capture.completed_at is not None:
+                        response_text = f"Capture {str(capture.id)[:8]} is already complete."
+                    else:
+                        capture.completed_at = datetime.now(UTC)
+                        response_text = f"Marked capture {str(capture.id)[:8]} as complete."
+            elif command_name == "/correct":
+                parts = command[1].split(maxsplit=2)
+                if len(parts) != 3 or parts[1].casefold() not in CORRECTABLE_FIELDS:
+                    response_text = correction_help()
+                else:
+                    capture = resolve_capture(
+                        session,
+                        conversation_id=message.channel.id,
+                        selector=parts[0],
+                    )
+                    if capture is None:
+                        response_text = "No active capture matched that item number or ID."
+                    elif apply_correction(
+                        session,
+                        capture,
+                        field=parts[1],
+                        value=parts[2],
+                    ):
+                        correction_capture = capture
+                        response_text = (
+                            f"Corrected {parts[1].casefold()} for capture "
+                            f"{str(capture.id)[:8]}. The original capture was preserved."
+                        )
+                    else:
+                        response_text = "That field already has this value, or the value is empty."
             elif command_name == "/ask":
                 if not command[1]:
                     response_text = "Usage: /ask <query>. Example: /ask electrician"
@@ -1011,7 +1133,8 @@ async def process_discord_message(
             else:
                 response_text = (
                     "I don’t recognize that command yet. Send text to save it, "
-                    "or use /recent, /ask, /save, /retry, and /undo."
+                    "or use /recent, /ask, /save, /retry, /inspect, /delete, "
+                    "/complete, /correct, and /undo."
                 )
             try:
                 session.commit()
@@ -1023,6 +1146,8 @@ async def process_discord_message(
             await _send_ack(message, response_text)
             if save_capture is not None and enrichment_scheduler is not None:
                 enrichment_scheduler(save_capture.id)
+            if correction_capture is not None and enrichment_scheduler is not None:
+                enrichment_scheduler(correction_capture.id)
             if command_name == "/retry" and retry_capture is not None:
                 if retry_capture.processing_status == TRANSCRIPTION_FAILED_STATUS:
                     if transcription_scheduler is not None:
