@@ -1700,7 +1700,7 @@ def test_management_recent_inspect_delete_and_retrieval_state(
         prefix = str(deleted.id)[:8]
     inspect_deleted = FakeMessage(205, f"/inspect {prefix}")
     run_message(inspect_deleted, session_factory)
-    assert "Status: captured" in inspect_deleted.channel.sent_messages[-1]
+    assert "Status: captured; deleted" in inspect_deleted.channel.sent_messages[-1]
     assert "Original: Second management note" in inspect_deleted.channel.sent_messages[-1]
 
 

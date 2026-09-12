@@ -286,6 +286,8 @@ def _format_inspect(capture: Capture) -> str:
     status = capture.processing_status
     if capture.completed_at is not None:
         status = f"{status}; completed"
+    if capture.deleted_at is not None:
+        status = f"{status}; deleted"
     lines = [
         f"Capture {capture.id}",
         f"Type: {capture.source_type}",
