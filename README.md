@@ -6,7 +6,15 @@ The product requirements are in [PRD.md](PRD.md), the implementation plan is in
 [VERTICAL_SLICES.md](VERTICAL_SLICES.md), and the end-to-end QA checklist is in
 [TEST_CASES.md](TEST_CASES.md).
 
-## Current status
+## V1 status
+
+**Complete.** All twelve vertical slices are implemented, migrated, and covered by
+the automated test suite. The GitHub issues for V1 are closed, and the work is
+recorded in the [V1 — Complete milestone](https://github.com/saadK3/personal-ai-inbox/milestone/5).
+The next phase is extended personal-use testing with the Discord bot and focused
+iteration based on anything that does not behave as expected.
+
+## Implemented capabilities
 
 The repository contains the development scaffold and all twelve V1 product slices. It includes:
 
