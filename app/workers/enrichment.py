@@ -273,7 +273,11 @@ async def enrich_capture(
         if processed_capture is None or processed_capture.deleted_at is not None:
             return False
         processed_capture.normalized_text = normalized_text
-        processed_capture.summary = summary if store_summary else None
+        processed_capture.summary = (
+            summary
+            if store_summary or "summary" in corrections
+            else None
+        )
         processed_capture.inferred_type = inferred_type
         processed_capture.topics = result.topics
         processed_capture.entities = result.entities

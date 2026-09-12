@@ -472,7 +472,7 @@ def _format_search_results(captures: list[Capture], query: str) -> str:
             lines.append("   Type: image")
         if capture.completed_at is not None:
             lines.append("   Status: completed")
-        if capture.summary and capture.source_type not in {"youtube", "github", "image"}:
+        if capture.summary:
             lines.append(f"   Summary: {_truncate(capture.summary, 240)}")
         lines.append(f"   Source: {_capture_source(capture)}")
     return _truncate("\n".join(lines))
