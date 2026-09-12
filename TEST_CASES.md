@@ -1,6 +1,6 @@
 # Personal AI Inbox — End-to-End Test Cases
 
-These cases cover the user-visible behavior delivered by Slices 1–10.
+These cases cover the user-visible behavior delivered by Slices 1–12.
 
 ## Preconditions
 
@@ -63,6 +63,23 @@ make test
 .venv/bin/ruff check app tests
 ```
 
-The Slice 10 implementation and the previous slices currently pass 50 automated tests. The
-manual cases above cover Discord Gateway behavior, real attachments, provider fallbacks, and
-the personal-use workflow that unit tests cannot fully exercise.
+## Related memories and recovery (Slices 11–12)
+
+1. Save and process a note that is strongly related to an older note. Confirm the bot sends at
+   most one concise related-memory notice with a relation ID and connection explanation.
+2. Save an obvious duplicate, a weakly similar item, and an unrelated item. Confirm no noisy
+   suggestions are shown for those captures. `/related <item>` lists only active strong matches.
+3. Run `/feedback <relation-id> not useful`, then `/related <item>` again. Confirm the dismissed
+   connection is suppressed. Repeat with `useful` and confirm the feedback is retained.
+4. Create a failed capture and run `/failures`. Confirm the error, short ID, and targeted
+   `/retry <short-id>` instruction are visible. Retry it without resending the original.
+5. Run `/export` and confirm Discord receives a ZIP. Inspect `inbox.json` for original text,
+   derived fields, deleted state, corrections, and relationship feedback; verify available local
+   media is present under `media/`.
+6. Restore the ZIP into a fresh database with `python -m app.backup restore ...`. Confirm the
+   capture, derived fields, corrections, relationships, and local media are recovered. Run the
+   restore a second time and confirm no duplicates are created.
+
+The full V1 implementation currently passes the automated test suite. The manual cases above
+cover Discord Gateway behavior, real attachments, provider fallbacks, related-memory quality,
+backup/recovery, and the personal-use workflow that unit tests cannot fully exercise.

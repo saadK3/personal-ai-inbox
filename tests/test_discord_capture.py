@@ -1,24 +1,32 @@
 import asyncio
 import json
 import uuid
+import zipfile
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.channels.discord import _route_message, _search_captures, process_discord_message
 from app.core.config import Settings
-from app.models import Capture, CaptureCorrection, MessageReceipt
+from app.db import Base
+from app.models import Capture, CaptureCorrection, CaptureRelation, MessageReceipt
 from app.providers.openai import EnrichmentResult, OpenAIProvider, VisionResult
+from app.services.backup import restore_inbox
 from app.services.github import (
     GitHubMetadata,
     canonicalize_github_url,
     extract_github_url,
     parse_github_url,
+)
+from app.services.related import (
+    discover_related_memories,
+    pending_related_memories,
+    related_memories,
 )
 from app.services.webpage import WebpageMetadata
 from app.services.youtube import (
@@ -1844,3 +1852,203 @@ def test_completion_is_visible_and_authorization_protects_mutations(
         assert capture is not None
         assert capture.deleted_at is None
         assert capture.completed_at is not None
+
+
+def test_related_memory_discovery_is_conservative_and_feedback_suppresses(
+    session_factory: sessionmaker[Session],
+) -> None:
+    now = datetime.now(UTC)
+    with session_factory() as session:
+        target = Capture(
+            platform="discord",
+            external_message_id=300,
+            conversation_id=456,
+            sender_id=123,
+            raw_text="A friend recommended a Japanese ramen spot in F7",
+            normalized_text="friend recommended Japanese ramen spot in F7",
+            embedding=[0.98, 0.2],
+            processing_status="processed",
+            created_at=now - timedelta(days=2),
+        )
+        duplicate = Capture(
+            platform="discord",
+            external_message_id=301,
+            conversation_id=456,
+            sender_id=123,
+            raw_text="Plan a Japanese ramen dinner in F7",
+            normalized_text="plan a Japanese ramen dinner in F7",
+            embedding=[1.0, 0.0],
+            processing_status="processed",
+            created_at=now - timedelta(days=1, seconds=1),
+        )
+        weak = Capture(
+            platform="discord",
+            external_message_id=302,
+            conversation_id=456,
+            sender_id=123,
+            raw_text="Renew the car registration",
+            normalized_text="renew car registration",
+            embedding=[0.7, 0.714],
+            processing_status="processed",
+            created_at=now - timedelta(days=1),
+        )
+        source = Capture(
+            platform="discord",
+            external_message_id=303,
+            conversation_id=456,
+            sender_id=123,
+            raw_text="Plan a Japanese ramen dinner in F7",
+            normalized_text="plan a Japanese ramen dinner in F7",
+            embedding=[1.0, 0.0],
+            processing_status="processed",
+            created_at=now,
+        )
+        session.add_all([target, duplicate, weak, source])
+        session.commit()
+        relations = discover_related_memories(session, source.id)
+        session.commit()
+        assert len(relations) == 1
+        assert relations[0].target_capture_id == target.id
+        assert "ramen" in relations[0].explanation
+
+        related_command = FakeMessage(304, f"/related {str(source.id)[:8]}")
+        run_message(related_command, session_factory)
+        assert str(relations[0].id)[:8] in related_command.channel.sent_messages[-1]
+        assert "Connection:" in related_command.channel.sent_messages[-1]
+
+        feedback = FakeMessage(305, f"/feedback {str(relations[0].id)[:8]} not useful")
+        run_message(feedback, session_factory)
+        assert feedback.channel.sent_messages == ["Marked that connection as not useful."]
+
+        session.expire_all()
+        refreshed = session.get(CaptureRelation, relations[0].id)
+        assert refreshed is not None
+        assert refreshed.feedback == "not_useful"
+        assert refreshed.active is False
+        assert related_memories(session, source.id) == []
+        assert pending_related_memories(session, source.id) == []
+
+
+def test_failures_can_be_inspected_and_retried_by_id(
+    session_factory: sessionmaker[Session],
+) -> None:
+    with session_factory() as session:
+        failed = Capture(
+            platform="discord",
+            external_message_id=306,
+            conversation_id=456,
+            sender_id=123,
+            raw_text="A capture that needs retrying",
+            processing_status="failed",
+            processing_error="provider unavailable",
+        )
+        session.add(failed)
+        session.commit()
+        failed_id = failed.id
+        prefix = str(failed.id)[:8]
+
+    failures = FakeMessage(307, "/failures")
+    run_message(failures, session_factory)
+    assert prefix in failures.channel.sent_messages[-1]
+    assert "provider unavailable" in failures.channel.sent_messages[-1]
+
+    scheduled: list[object] = []
+    retry = FakeMessage(308, f"/retry {prefix}")
+    asyncio.run(
+        process_discord_message(
+            retry,
+            Settings(discord_allowed_user_id=123),
+            session_factory,
+            enrichment_scheduler=scheduled.append,
+        )
+    )
+    assert retry.channel.sent_messages == [
+        "Retrying enrichment for: A capture that needs retrying"
+    ]
+    assert scheduled == [failed_id]
+
+
+def test_export_is_complete_and_restorable(
+    session_factory: sessionmaker[Session],
+    tmp_path: Path,
+) -> None:
+    media_path = tmp_path / "images" / "capture.png"
+    media_path.parent.mkdir(parents=True)
+    media_path.write_bytes(b"image bytes")
+    with session_factory() as session:
+        capture = Capture(
+            platform="discord",
+            external_message_id=309,
+            conversation_id=456,
+            sender_id=123,
+            source_type="image",
+            raw_text="A screenshot of the settings page",
+            source_metadata={
+                "submitted_text": "Settings screenshot",
+                "image": {"local_path": str(media_path), "filename": "capture.png"},
+            },
+            normalized_text="settings screenshot",
+            summary="Settings screenshot",
+            inferred_type="reference",
+            topics=["settings"],
+            processing_status="processed",
+            embedding=[1.0, 0.0],
+        )
+        session.add(capture)
+        session.commit()
+        capture_text = capture.raw_text
+        session.add(
+            CaptureCorrection(
+                capture_id=capture.id,
+                field="summary",
+                old_value="Original summary",
+                new_value="Corrected settings summary",
+            )
+        )
+        session.commit()
+
+    export_message = FakeMessage(310, "/export")
+    run_message(
+        export_message,
+        session_factory,
+        Settings(discord_allowed_user_id=123, storage_dir=tmp_path),
+    )
+    assert export_message.channel.sent_messages[0].startswith("Export ready: ")
+    archives = list((tmp_path / "exports").glob("*.zip"))
+    assert len(archives) == 1
+    with zipfile.ZipFile(archives[0]) as archive:
+        assert "inbox.json" in archive.namelist()
+        assert "media/images/capture.png" in archive.namelist()
+        payload = json.loads(archive.read("inbox.json"))
+        assert payload["captures"][0]["raw_text"] == capture_text
+
+    restore_db = tmp_path / "restore.sqlite"
+    restore_engine = create_engine(
+        f"sqlite+pysqlite:///{restore_db}",
+        connect_args={"check_same_thread": False},
+    )
+    restore_factory = sessionmaker(bind=restore_engine, autoflush=False, autocommit=False)
+    Base.metadata.create_all(restore_engine)
+    try:
+        result = restore_inbox(
+            restore_factory,
+            archives[0],
+            storage_dir=tmp_path / "restored-data",
+        )
+        assert result.captures_created == 1
+        assert result.corrections_restored == 1
+        with restore_factory() as session:
+            restored = session.scalar(select(Capture).where(Capture.external_message_id == 309))
+            assert restored is not None
+            assert restored.raw_text == capture_text
+            restored_media = restored.source_metadata["image"]["local_path"]
+            assert Path(restored_media).is_file()
+            correction = session.scalar(select(CaptureCorrection))
+            assert correction is not None
+            assert correction.new_value == "Corrected settings summary"
+        second_result = restore_inbox(restore_factory, archives[0])
+        assert second_result.captures_created == 0
+        assert second_result.corrections_restored == 0
+    finally:
+        Base.metadata.drop_all(restore_engine)
+        restore_engine.dispose()

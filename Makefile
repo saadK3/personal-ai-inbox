@@ -1,4 +1,4 @@
-.PHONY: install db-up db-down migrate dev bot test lint
+.PHONY: install db-up db-down migrate dev bot test lint export restore
 
 # Prefer the repository virtual environment so Make works in non-interactive
 # shells where the user's activated environment is not inherited.
@@ -31,3 +31,10 @@ test:
 
 lint:
 	$(PYTHON) -m ruff check .
+
+export:
+	$(PYTHON) -m app.backup export
+
+restore:
+	@test -n "$(ARCHIVE)" || (echo "Usage: make restore ARCHIVE=/path/to/export.zip" && exit 1)
+	$(PYTHON) -m app.backup restore "$(ARCHIVE)"

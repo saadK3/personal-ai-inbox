@@ -7,6 +7,7 @@ from sqlalchemy import (
     JSON,
     BigInteger,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -129,6 +130,53 @@ class CaptureCorrection(Base):
         nullable=True,
     )
     new_value: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(UTC),
+        server_default=func.now(),
+    )
+
+
+class CaptureRelation(Base):
+    """A conservative, user-reviewable connection between two captures."""
+
+    __tablename__ = "capture_relations"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_capture_id",
+            "target_capture_id",
+            name="uq_capture_relations_source_target",
+        ),
+        Index(
+            "ix_capture_relations_source_active_similarity",
+            "source_capture_id",
+            "active",
+            "similarity",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    source_capture_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("captures.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    target_capture_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("captures.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    relationship: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="related", server_default="related"
+    )
+    similarity: Mapped[float] = mapped_column(Float, nullable=False)
+    explanation: Mapped[str] = mapped_column(Text, nullable=False)
+    active: Mapped[bool] = mapped_column(
+        nullable=False, default=True, server_default="true"
+    )
+    feedback: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.core.config import Settings
 from app.models.capture import Capture, MessageReceipt
 from app.providers.openai import EnrichmentProvider, OpenAIProvider
+from app.services.backup import export_inbox
 from app.services.github import canonicalize_github_url, extract_github_url
 from app.services.management import (
     CORRECTABLE_FIELDS,
@@ -22,6 +23,14 @@ from app.services.management import (
     correction_help,
     latest_capture,
     resolve_capture,
+)
+from app.services.related import (
+    FEEDBACK_VALUES,
+    RelatedMemory,
+    pending_related_memories,
+    record_feedback,
+    related_memories,
+    resolve_relation,
 )
 from app.services.webpage import canonicalize_url, extract_url
 from app.services.youtube import canonicalize_youtube_url, extract_youtube_url
@@ -75,6 +84,14 @@ YouTubeExtractionScheduler = Callable[[uuid.UUID], None]
 GitHubExtractionScheduler = Callable[[uuid.UUID], None]
 ImageProcessingScheduler = Callable[[uuid.UUID], None]
 MessageRoute = Literal["command", "query", "capture"]
+FAILED_PROCESSING_STATUSES = {
+    "failed",
+    TRANSCRIPTION_FAILED_STATUS,
+    WEB_EXTRACTION_FAILED_STATUS,
+    YOUTUBE_EXTRACTION_FAILED_STATUS,
+    GITHUB_EXTRACTION_FAILED_STATUS,
+    IMAGE_FAILED_STATUS,
+}
 SUPPORTED_AUDIO_EXTENSIONS = {
     ".flac",
     ".m4a",
@@ -307,6 +324,78 @@ def _format_inspect(capture: Capture) -> str:
     if isinstance(metadata.get("url"), str):
         lines.append(f"Submitted URL: {metadata['url']}")
     return _truncate("\n".join(lines))
+
+
+def _capture_display_text(capture: Capture) -> str:
+    if capture.source_type == "webpage":
+        return _webpage_display_name(capture)
+    if capture.source_type == "youtube":
+        return _youtube_display_name(capture)
+    if capture.source_type == "github":
+        return _github_display_name(capture)
+    if capture.source_type == "image":
+        return _image_display_name(capture)
+    if capture.source_type == "voice":
+        return _voice_display_name(capture)
+    return " ".join(capture.raw_text.split())
+
+
+def _format_related_results(
+    relationships: list[RelatedMemory],
+    capture: Capture,
+) -> str:
+    if not relationships:
+        return f"No strong related memories found for {str(capture.id)[:8]}."
+    lines = [f"Related memories for {str(capture.id)[:8]}:"]
+    for index, related in enumerate(relationships, start=1):
+        target = related.capture
+        lines.append(
+            f"{index}. id:{str(related.relation.id)[:8]} "
+            f"({related.relation.similarity:.0%}) {_capture_display_text(target)}"
+        )
+        lines.append(f"   Connection: {related.relation.explanation}")
+        lines.append(f"   Source: {_capture_source(target)}")
+    lines.append("Use `/feedback <relation-id> useful` or `not useful` to teach me.")
+    return _truncate("\n".join(lines))
+
+
+def _format_failed_captures(captures: list[Capture]) -> str:
+    if not captures:
+        return "No failed processing jobs."
+    lines = ["Failed processing jobs:"]
+    for index, capture in enumerate(captures, start=1):
+        error = _truncate(capture.processing_error or "No error recorded", 260)
+        lines.append(
+            f"{index}. id:{str(capture.id)[:8]} "
+            f"{capture.processing_status} — {_capture_display_text(capture)}"
+        )
+        lines.append(f"   Error: {error}")
+        lines.append(f"   Retry: `/retry {str(capture.id)[:8]}`")
+        if len("\n".join(lines)) > DISCORD_MESSAGE_LIMIT - 20:
+            lines.append("...more failures are available in the database export")
+            break
+    return _truncate("\n".join(lines))
+
+
+async def _send_export(message: Any, export_path: Path) -> bool:
+    """Send a ZIP export as a Discord attachment, with a test-safe text fallback."""
+
+    response_text = f"Export ready: {export_path.name}"
+    attachment = discord.File(export_path, filename=export_path.name)
+    try:
+        await message.channel.send(
+            content=response_text,
+            file=attachment,
+        )
+    except TypeError:
+        # Lightweight fake channels used by the automated tests accept only text.
+        return await _send_ack(message, response_text)
+    except Exception:
+        logger.exception("Failed to send inbox export")
+        return False
+    finally:
+        attachment.close()
+    return True
 
 
 def _search_tokens(text: str) -> list[str]:
@@ -949,6 +1038,7 @@ async def process_discord_message(
             retry_capture: Capture | None = None
             save_capture: Capture | None = None
             correction_capture: Capture | None = None
+            export_requested = False
             if command_name in {"/start", "/help"}:
                 response_text = (
                     "Send me a note and I’ll save it, or ask a clear question "
@@ -956,7 +1046,9 @@ async def process_discord_message(
                     "/ask <query> to search explicitly, /save <text> to force "
                     "a save, send a URL to save its metadata, /retry to "
                     "reprocess a failed capture, /inspect <item>, /delete <item>, "
-                    "/complete <item>, /correct <item> <field> <value>, or /undo."
+                    "/complete <item>, /correct <item> <field> <value>, /related, "
+                    "/feedback <relation-id> <useful|not useful>, /failures, "
+                    "/export, or /undo."
                 )
             elif command_name == "/recent":
                 captures = list(
@@ -1060,6 +1152,72 @@ async def process_discord_message(
                         )
                     else:
                         response_text = "That field already has this value, or the value is empty."
+            elif command_name == "/related":
+                if command[1]:
+                    related_capture = resolve_capture(
+                        session,
+                        conversation_id=message.channel.id,
+                        selector=command[1],
+                    )
+                else:
+                    related_capture = session.scalar(
+                        select(Capture)
+                        .where(
+                            Capture.platform == PLATFORM,
+                            Capture.conversation_id == message.channel.id,
+                            Capture.deleted_at.is_(None),
+                        )
+                        .order_by(Capture.created_at.desc(), Capture.id.desc())
+                        .limit(1)
+                    )
+                response_text = (
+                    "No active capture matched that item number or ID."
+                    if related_capture is None
+                    else _format_related_results(
+                        related_memories(session, related_capture.id),
+                        related_capture,
+                    )
+                )
+            elif command_name == "/feedback":
+                parts = command[1].split(maxsplit=1)
+                normalized_feedback = (
+                    parts[1].casefold().replace("-", "_").replace(" ", "_")
+                    if len(parts) == 2
+                    else ""
+                )
+                if len(parts) != 2 or normalized_feedback not in FEEDBACK_VALUES:
+                    response_text = "Usage: /feedback <relation-id> <useful|not useful>"
+                else:
+                    relation = resolve_relation(
+                        session,
+                        conversation_id=message.channel.id,
+                        selector=parts[0],
+                    )
+                    if relation is None:
+                        response_text = "No related-memory connection matched that ID."
+                    elif record_feedback(session, relation, normalized_feedback):
+                        label = "useful" if normalized_feedback == "useful" else "not useful"
+                        response_text = f"Marked that connection as {label}."
+                    else:
+                        response_text = "Use `useful` or `not useful` for feedback."
+            elif command_name in {"/failures", "/failed"}:
+                failed_captures = list(
+                    session.scalars(
+                        select(Capture)
+                        .where(
+                            Capture.platform == PLATFORM,
+                            Capture.conversation_id == message.channel.id,
+                            Capture.deleted_at.is_(None),
+                            Capture.processing_status.in_(FAILED_PROCESSING_STATUSES),
+                        )
+                        .order_by(Capture.created_at.desc(), Capture.id.desc())
+                        .limit(20)
+                    )
+                )
+                response_text = _format_failed_captures(failed_captures)
+            elif command_name == "/export":
+                export_requested = True
+                response_text = "Preparing a complete inbox export…"
             elif command_name == "/ask":
                 if not command[1]:
                     response_text = "Usage: /ask <query>. Example: /ask electrician"
@@ -1086,28 +1244,36 @@ async def process_discord_message(
                     session.add(save_capture)
                     response_text = f"Saved: {command[1]}"
             elif command_name == "/retry":
-                retry_capture = session.scalar(
-                    select(Capture)
-                    .where(
-                        Capture.platform == PLATFORM,
-                        Capture.conversation_id == message.channel.id,
-                        Capture.deleted_at.is_(None),
-                        Capture.processing_status.in_(
-                            {
-                                "failed",
-                                TRANSCRIPTION_FAILED_STATUS,
-                                WEB_EXTRACTION_FAILED_STATUS,
-                                YOUTUBE_EXTRACTION_FAILED_STATUS,
-                                GITHUB_EXTRACTION_FAILED_STATUS,
-                                IMAGE_FAILED_STATUS,
-                            }
-                        ),
+                if command[1]:
+                    retry_capture = resolve_capture(
+                        session,
+                        conversation_id=message.channel.id,
+                        selector=command[1],
                     )
-                    .order_by(Capture.created_at.desc(), Capture.id.desc())
-                    .limit(1)
-                )
+                else:
+                    retry_capture = session.scalar(
+                        select(Capture)
+                        .where(
+                            Capture.platform == PLATFORM,
+                            Capture.conversation_id == message.channel.id,
+                            Capture.deleted_at.is_(None),
+                            Capture.processing_status.in_(FAILED_PROCESSING_STATUSES),
+                        )
+                        .order_by(Capture.created_at.desc(), Capture.id.desc())
+                        .limit(1)
+                    )
                 if retry_capture is None:
-                    response_text = "No failed captures need retrying."
+                    response_text = (
+                        "No active capture matched that item number or ID."
+                        if command[1]
+                        else "No failed captures need retrying."
+                    )
+                elif retry_capture.processing_status not in FAILED_PROCESSING_STATUSES:
+                    response_text = (
+                        f"Capture {str(retry_capture.id)[:8]} is not failed "
+                        f"(status: {retry_capture.processing_status})."
+                    )
+                    retry_capture = None
                 elif retry_capture.processing_status == TRANSCRIPTION_FAILED_STATUS:
                     response_text = (
                         f"Retrying transcription for: {_voice_display_name(retry_capture)}"
@@ -1137,7 +1303,8 @@ async def process_discord_message(
                 response_text = (
                     "I don’t recognize that command yet. Send text to save it, "
                     "or use /recent, /ask, /save, /retry, /inspect, /delete, "
-                    "/complete, /correct, and /undo."
+                    "/complete, /correct, /related, /feedback, /failures, /export, "
+                    "and /undo."
                 )
             try:
                 session.commit()
@@ -1146,7 +1313,19 @@ async def process_discord_message(
             except IntegrityError:
                 session.rollback()
                 return
-            await _send_ack(message, response_text)
+            if export_requested:
+                try:
+                    export_path = export_inbox(session_factory, settings.storage_dir)
+                except Exception:
+                    logger.exception("Inbox export failed")
+                    await _send_ack(
+                        message,
+                        "I couldn’t create the inbox export. Check `/failures` and try again.",
+                    )
+                else:
+                    await _send_export(message, export_path)
+            else:
+                await _send_ack(message, response_text)
             if save_capture is not None and enrichment_scheduler is not None:
                 enrichment_scheduler(save_capture.id)
             if correction_capture is not None and enrichment_scheduler is not None:
@@ -1522,11 +1701,8 @@ class PersonalInboxDiscordClient(discord.Client):
         if current_task is not None and not current_task.done():
             return
         task = asyncio.create_task(
-            enrich_capture(
+            self._enrich_and_notify(
                 capture_id,
-                settings=self.settings,
-                session_factory=self.session_factory,
-                provider=self.provider,
                 store_summary=store_summary,
             )
         )
@@ -1544,6 +1720,63 @@ class PersonalInboxDiscordClient(discord.Client):
                     )
 
         task.add_done_callback(_forget)
+
+    async def _enrich_and_notify(
+        self,
+        capture_id: uuid.UUID,
+        *,
+        store_summary: bool | None,
+    ) -> None:
+        succeeded = await enrich_capture(
+            capture_id,
+            settings=self.settings,
+            session_factory=self.session_factory,
+            provider=self.provider,
+            store_summary=True if store_summary is None else store_summary,
+        )
+        if not succeeded:
+            return
+        session = self.session_factory()
+        try:
+            source = session.get(Capture, capture_id)
+            if source is None:
+                return
+            suggestions = pending_related_memories(session, capture_id)
+            if not suggestions:
+                return
+            channel_id = (source.source_metadata or {}).get("channel_id")
+            if channel_id is None:
+                return
+            try:
+                channel = self.get_channel(int(channel_id))
+                if channel is None:
+                    channel = await self.fetch_channel(int(channel_id))
+            except Exception:
+                logger.exception(
+                    "Unable to open Discord channel for related-memory notice",
+                    extra={"capture_id": str(capture_id)},
+                )
+                return
+            related = suggestions[0]
+            relation_id = str(related.relation.id)[:8]
+            message = _truncate(
+                f"Related memory: {_capture_display_text(related.capture)}\n"
+                f"Connection: {related.relation.explanation}\n"
+                f"Source: {_capture_source(related.capture)}\n"
+                f"Was this useful? `/feedback {relation_id} useful` or "
+                f"`/feedback {relation_id} not useful`"
+            )
+            await channel.send(message)
+            related.relation.notified_at = datetime.now(UTC)
+            session.commit()
+        except Exception:
+            session.rollback()
+            logger.exception(
+                "Related-memory notification failed",
+                extra={"capture_id": str(capture_id)},
+            )
+        finally:
+            session.close()
 
     def schedule_transcription(self, capture_id: uuid.UUID) -> None:
         """Queue voice transcription and continue into normal enrichment."""

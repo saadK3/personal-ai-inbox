@@ -8,7 +8,7 @@ The product requirements are in [PRD.md](PRD.md), the implementation plan is in
 
 ## Current status
 
-The repository contains the development scaffold and the first ten product slices. It includes:
+The repository contains the development scaffold and all twelve V1 product slices. It includes:
 
 - FastAPI application with liveness and database-readiness endpoints
 - Discord Gateway bot for private DM capture
@@ -22,8 +22,9 @@ Vertical Slices 1 and 2â€”private Discord text capture and exact text retrievalâ
 are implemented, Slice 3 adds semantic memory and hybrid retrieval, Slice 4 adds
 natural save/query routing, Slice 5 adds voice-note memory, Slice 6 adds webpage
 memory, Slice 7 adds YouTube memory, Slice 8 adds GitHub repository memory, Slice 9
-adds image/screenshot memory, and Slice 10 adds user-controlled management and
-corrections. Text captures, voice-note transcripts,
+adds image/screenshot memory, Slice 10 adds user-controlled management and
+corrections, Slice 11 adds conservative related-memory discovery, and Slice 12
+adds export and recovery. Text captures, voice-note transcripts,
 webpage metadata, YouTube metadata, GitHub metadata, and image descriptions/OCR are
 acknowledged first, then processed asynchronously. Text, voice, and webpage captures
 also receive normalized text, a summary, type, topics, entities, and an embedding;
@@ -137,6 +138,13 @@ the original context and source, `/delete <item>` soft-deletes an item, `/comple
 <item>` marks it complete, and `/correct <item> <summary|type|meaning> <value>`
 updates derived fields while preserving the original capture. `/undo` safely
 removes the latest capture and will not remove an older item on a second attempt.
+After a strong match is found, the bot may send one conservative related-memory notice. Use
+`/related [item]` to review stored connections and `/feedback <relation-id> useful` or
+`/feedback <relation-id> not useful` to teach it what is helpful. `/failures` lists failed
+processing jobs and `/retry <item>` retries a selected failure. `/export` creates a ZIP export
+and sends it as a Discord attachment. The full backup, restore, media, and provider-privacy
+policy is documented in [BACKUP_RECOVERY.md](BACKUP_RECOVERY.md); the command-line equivalents
+are `make export` and `make restore ARCHIVE=/path/to/export.zip`.
 
 Run checks:
 

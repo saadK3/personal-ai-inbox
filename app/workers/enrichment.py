@@ -16,6 +16,7 @@ from app.core.config import Settings
 from app.models.capture import Capture
 from app.providers.openai import EnrichmentProvider, OpenAIProvider
 from app.services.management import latest_corrections
+from app.services.related import discover_related_memories
 
 logger = logging.getLogger(__name__)
 PROCESSING_STATUS = "processing"
@@ -287,6 +288,17 @@ async def enrich_capture(
         processed_capture.processing_error = None
         processed_capture.processed_at = datetime.now(UTC)
         success_session.commit()
+        try:
+            discover_related_memories(success_session, capture_id)
+            success_session.commit()
+        except Exception:
+            # A relationship failure must never turn a durable enrichment into
+            # a failed capture. The next enrichment can safely try again.
+            success_session.rollback()
+            logger.exception(
+                "Related-memory discovery failed",
+                extra={"capture_id": str(capture_id)},
+            )
         return True
     except Exception as exc:
         success_session.rollback()
