@@ -1,5 +1,6 @@
 import asyncio
 import json
+import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1702,6 +1703,31 @@ def test_management_recent_inspect_delete_and_retrieval_state(
     run_message(inspect_deleted, session_factory)
     assert "Status: captured; deleted" in inspect_deleted.channel.sent_messages[-1]
     assert "Original: Second management note" in inspect_deleted.channel.sent_messages[-1]
+
+
+def test_deleted_capture_with_numeric_uuid_prefix_can_be_inspected(
+    session_factory: sessionmaker[Session],
+) -> None:
+    capture_id = uuid.UUID("12345678-abcd-4ef0-8123-456789abcdef")
+    with session_factory() as session:
+        session.add(
+            Capture(
+                id=capture_id,
+                platform="discord",
+                external_message_id=206,
+                conversation_id=456,
+                sender_id=123,
+                raw_text="Numeric UUID prefix note",
+                deleted_at=datetime.now(UTC),
+            )
+        )
+        session.commit()
+
+    inspect_deleted = FakeMessage(207, "/inspect 12345678")
+    run_message(inspect_deleted, session_factory)
+
+    assert "Status: captured; deleted" in inspect_deleted.channel.sent_messages[-1]
+    assert f"Capture {capture_id}" in inspect_deleted.channel.sent_messages[-1]
 
 
 def test_undo_is_idempotent_and_does_not_delete_an_older_capture(

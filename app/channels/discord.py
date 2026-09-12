@@ -366,7 +366,8 @@ def _capture_source(capture: Capture) -> str:
     channel_id = metadata.get("channel_id")
     message_id = metadata.get("message_id")
     if capture.platform == PLATFORM and channel_id and message_id:
-        return f"https://discord.com/channels/@me/{channel_id}/{message_id}"
+        url = f"https://discord.com/channels/@me/{channel_id}/{message_id}"
+        return f"[{url}]({url})"
     return capture.platform
 
 

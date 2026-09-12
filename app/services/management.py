@@ -55,9 +55,12 @@ def resolve_capture(
     captures = _active_captures(session, conversation_id)
     if normalized.isdecimal():
         ordinal = int(normalized)
-        if ordinal < 1 or ordinal > len(captures):
-            return None
-        return captures[ordinal - 1]
+        # Keep numeric item numbers convenient, but let an out-of-range
+        # number fall through to UUID-prefix matching. UUID prefixes are
+        # random, so an eight-character prefix can legitimately contain
+        # digits only (for example, ``12345678``).
+        if 1 <= ordinal <= len(captures):
+            return captures[ordinal - 1]
 
     candidates = captures
     if include_deleted:
@@ -81,7 +84,11 @@ def resolve_capture(
                 return capture
         return None
     folded = normalized.casefold()
-    matches = [capture for capture in candidates if str(capture.id).startswith(folded)]
+    matches = [
+        capture
+        for capture in candidates
+        if str(capture.id).casefold().startswith(folded)
+    ]
     return matches[0] if len(matches) == 1 else None
 
 
